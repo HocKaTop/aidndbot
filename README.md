@@ -1,0 +1,255 @@
+# Nocturna
+
+Учебная D&D-like RPG в Telegram Mini App: общие комнаты, персонажи, AI Game Master через локальную Ollama и игровые механики на Go.
+
+## Что работает
+
+- Telegram initData: HMAC/hash, время авторизации, серверная сессия на 12 часов; отдельной регистрации нет.
+- Создание кампании, настройки владельца, приглашение по коду/ссылке, лобби, персонажи и готовность.
+- WebSocket с авторизацией первым сообщением, переподключением, ping и обновлением участников.
+- Старт и пауза кампании, свободные текстовые действия и структурированные ответы Ollama.
+- Серверные кубики, проверки характеристик, атаки, ответные атаки NPC, HP и лечебные зелья.
+- Сцены, NPC, квесты, инвентарь и журнал событий в PostgreSQL.
+- Telegram-бот внутри backend: long polling, текстовая игра и кнопка Mini App при настроенном HTTPS.
+- Мобильный React-интерфейс с экранами кампаний, лобби, игры, героя, инвентаря и журнала.
+
+Это упрощённая RPG. Классы и расы пока описательные: у всех героев одинаковые стартовые характеристики; нет заклинаний, прокачки уровней, инициативы D&D и восстановления погибших героев. Вход/выход игроков и настройки доступны до старта. Владелец остаётся в комнате. Флаги готовности информационные; для старта достаточно одного персонажа. Бросок кубика из UI записывается в журнал, но сам по себе не изменяет HP.
+
+## Архитектура
+
+```text
+Telegram → Mini App → nginx → Go (REST + WebSocket + Bot)
+                                ├─ PostgreSQL
+                                └─ Ollama на домашнем ПК
+```
+
+```text
+backend/
+  cmd/server/          запуск и graceful shutdown
+  internal/auth/       Telegram-подпись и подписанные сессии
+  internal/server/     HTTP, комнаты, runtime и очередь ходов
+  internal/game/       кубики, проверки, бой, состояние и действия
+  internal/ai/         AIProvider, prompt builder, Ollama JSON schema
+  internal/bot/        Telegram long polling
+  internal/store/      сгенерированный sqlc код
+  migrations/          SQL и embedded runner миграций
+  queries/             SQL-запросы для sqlc
+frontend/
+  src/                 React, TypeScript, Telegram SDK, WebSocket hook
+  nginx.conf           один origin для /, /api и /ws
+scripts/setup_env.py    подготовка локальных секретов
+```
+
+Один процесс Go и одна goroutine на активную комнату. Очередь ограничена 16 командами. Runtime без клиентов удаляется после 10 минут простоя. На команду отведено 150 секунд; сетевой запрос Ollama ограничен 120 секундами. Перезапуск очищает только соединения и очередь, завершённые ходы восстанавливаются из БД. Незавершённый ход откатывается; автоматического повтора действия после разрыва связи нет.
+
+`rooms.state` содержит версионируемый в будущих миграциях JSONB-снимок мира для атомарного восстановления. В той же транзакции обновляются таблицы персонажей, NPC, инвентаря, сцен, квестов, памяти и событий. Записи в комнате сериализуются блокировкой PostgreSQL `FOR UPDATE`, в том числе HTTP-запросы. Во время AI-хода блокировка удерживается до завершения двух запросов модели. Это осознанное упрощение для одного домашнего backend; UI сообщает о выполняющемся ходе. Состояние PROCESSING передаётся как временный WebSocket-флаг, а не хранится в БД.
+
+Модель сначала предлагает до четырёх действий. Движок валидирует их, выполняет максимум одну атаку/проверку за ход, рассчитывает числовые результаты и даёт NPC ответить. Затем модель получает результаты для повествования. Ошибка любого шага откатывает весь ход. Логи не содержат полных промптов и Telegram-токена.
+
+Контекст: настройки, текущее состояние, сцена, персонажи, NPC, квесты, последние 20 событий и до 6000 символов краткой памяти о подтверждённых изменениях движка. Память обновляется инкрементально; отдельного LLM-суммаризатора пока нет. API журнала возвращает последние 100 событий, полная история остаётся в БД.
+
+## Требования и быстрый запуск
+
+Для контейнерного запуска: Docker + Compose, Ollama с `qwen3:8b`, Telegram-бот. Для локальной разработки: Go 1.26+, Node.js 24, npm, sqlc. Python 3 нужен только для скрипта настройки.
+
+1. Создай `.env` по `.env.example`. Укажи `TELEGRAM_BOT_TOKEN` и `TELEGRAM_BOT_USERNAME` без `@`.
+2. Подготовь оставшиеся параметры, сохранив уже введённые секреты:
+
+   ```bash
+   python3 scripts/setup_env.py
+   ```
+
+3. На машине с Ollama:
+
+   ```bash
+   ollama pull qwen3:8b
+   ```
+
+4. Из корня проекта:
+
+   ```bash
+   docker compose up -d --build
+   docker compose ps
+   ```
+
+Открой http://localhost:8080. В обычном браузере показывается экран входа через Telegram; поддельного локального входа в приложении нет. Проверка доступности: http://localhost:8080/healthz.
+
+Миграции применяются при запуске backend под advisory lock; повторный запуск безопасен. PostgreSQL хранится в Docker volume. `docker compose down` останавливает проект и сохраняет данные. Не добавляй `-v`, если хочешь сохранить кампании.
+
+## Telegram и публичный HTTPS
+
+Для текстовой игры достаточно `BOT_ENABLED=true`. HTTPS нужен только для кнопки Mini App; при локальном `APP_BASE_URL` бот отвечает обычным текстом.
+
+### Игра прямо в чате
+
+Установи `BOT_ENABLED=true` в `.env`, выполни `docker compose up -d backend` и отправь боту:
+
+```text
+/start
+/create Ночная таверна
+/play
+Я открываю дверь таверны и осматриваюсь.
+```
+
+`/create` сразу создаёт кампанию и героя (человек-воин, 20 HP). До `/play` друзья могут присоединиться через `/join КОД`; им тоже создаётся герой. Каждому игроку нужно написать боту лично. Ответ на действие получает его автор; остальные читают обновления через `/history` и `/state`.
+
+Команды: `/state` — сцена, отряд, HP и предметы; `/history` — последние 10 событий; `/roll d20` — кубик; `/use 1` — применить предмет по номеру; `/pause` и `/play` — пауза/продолжение для владельца; `/rooms` — список кампаний; `/room КОД` — выбор своей кампании. Любое обычное сообщение во время игры становится действием персонажа. `/help` показывает подсказку.
+
+Авторизация текстового режима берёт `message.from.id` из Telegram Bot API; публичного обхода проверки initData нет. Состояние и механика общие с Mini App. Выбранная в чате комната сохраняется в PostgreSQL. Текстовые запросы обрабатываются последовательно; во время ответа Ollama бот может задержать обработку следующего сообщения. Сообщения, отправленные до запуска процесса, не исполняются повторно после рестарта — отправь команду снова после запуска.
+
+
+### Временный адрес без настройки домена
+
+```bash
+docker compose -f docker-compose.yml -f compose.tunnel.yml up -d tunnel
+docker compose -f docker-compose.yml -f compose.tunnel.yml logs tunnel
+```
+
+В логах появится `https://…trycloudflare.com`. Это публичный адрес приложения; он может измениться после пересоздания туннеля. Укажи его в `.env`:
+
+```dotenv
+APP_BASE_URL=https://YOUR-ADDRESS.trycloudflare.com
+BOT_ENABLED=true
+```
+
+Настроить адрес и кнопку меню бота автоматически можно командой (подставь выданный URL):
+
+```bash
+python3 scripts/configure_telegram.py https://YOUR-ADDRESS.trycloudflare.com
+docker compose up -d backend
+```
+
+Скрипт устанавливает кнопку «Открыть игру» через Telegram API, проверяет её и обновляет `APP_BASE_URL` в `.env`, сохраняя секреты. Чтобы открыть Mini App через меню чата или кнопку после `/start`, настройка Main Mini App в BotFather не обязательна. Для кнопки в профиле и invite-ссылок `?startapp=...` настрой Main Mini App ниже. После изменения временного адреса повтори команду и обнови URL в BotFather, если он уже указан там.
+
+В **@BotFather → /mybots → твой бот → Bot Settings → Configure Mini App** включи Main Mini App и задай тот же HTTPS URL. Затем отправь своему боту `/start` и нажми «Открыть Nocturna».
+
+Для Main Mini App `TELEGRAM_APP_NAME` оставь пустым. Приглашение выглядит так:
+
+```text
+https://t.me/BOT_USERNAME?startapp=ROOM_CODE
+```
+
+Если создал именованное приложение через `/newapp`, укажи его short name в `TELEGRAM_APP_NAME`. Тогда ссылка будет `https://t.me/BOT_USERNAME/APP_NAME?startapp=ROOM_CODE`.
+
+Открыв приглашение, игрок увидит заполненный код и сам подтвердит вход. После создания героя владелец запускает игру. Первое действие, например «Мы входим в заброшенную таверну», создаёт начальную сцену через AI.
+
+### Собственный домен
+
+Регистратор домена может остаться прежним. Добавь домен в Cloudflare, проверь DNS-записи и замени nameservers у регистратора на выданные Cloudflare. После активации создай постоянный Cloudflare Tunnel и маршрут для нужного поддомена на `http://localhost:8080`, если cloudflared запущен на ПК, либо `http://frontend:80`, если он в сети Compose. Обнови `APP_BASE_URL` и URL в BotFather. PostgreSQL и Ollama в туннель не добавляются.
+
+Документация: [Telegram Mini Apps](https://core.telegram.org/bots/webapps), [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/).
+
+## Ollama в Windows и backend в Docker
+
+По умолчанию используется `OLLAMA_URL=http://host.docker.internal:11434`. Проверка из контейнера:
+
+```bash
+docker compose exec backend wget -T 8 -qO- http://host.docker.internal:11434/api/tags
+```
+
+В списке должна быть `qwen3:8b`. Если запрос проходит, менять сетевые настройки Ollama не нужно. Если нет, проверь, запущена ли Ollama, доступ Docker Desktop к Windows и правила firewall; настройка адреса прослушивания описана в [Ollama FAQ](https://docs.ollama.com/faq). Не направляй Cloudflare Tunnel на порт 11434.
+
+## Переменные окружения
+
+| Имя | Назначение |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Токен BotFather |
+| `TELEGRAM_BOT_USERNAME` | Username без `@`, нужен для ссылок |
+| `TELEGRAM_APP_NAME` | Short name именованного Mini App; для Main Mini App пусто |
+| `APP_BASE_URL` | Единый origin приложения; публичный HTTPS для кнопки Mini App |
+| `BOT_ENABLED` | `true` включает long polling, по умолчанию `false` |
+| `POSTGRES_PASSWORD` | Пароль БД в Compose, генерируется скриптом |
+| `JWT_SECRET` | Ключ HMAC внутренней сессии, минимум 32 символа; сессия не JWT |
+| `OLLAMA_URL` | Адрес Ollama, доступный backend |
+| `DEFAULT_OLLAMA_MODEL` | По умолчанию `qwen3:8b`; можно выбрать в настройках комнаты |
+| `APP_PORT` | Локальный порт nginx, по умолчанию 8080 |
+| `DATABASE_URL` | Для запуска Go вне Compose; внутри формируется автоматически |
+| `HTTP_ADDR` | Адрес Go-сервера, по умолчанию `:8081` |
+
+Для совместимости `TELEGRAM_WEBAPP_URL` читается backend как запасной вариант при отсутствии `APP_BASE_URL`. Compose использует `APP_BASE_URL`. `.env` не попадает в Git и Docker build context.
+
+## Локальная разработка
+
+```bash
+# PostgreSQL с портом только на loopback:
+docker compose -f docker-compose.yml -f compose.dev.yml up -d postgres
+```
+
+Укажи локальный `DATABASE_URL` в `.env` с тем же паролем. Для shell-загрузки используй значения без пробелов или заключай их в кавычки:
+
+```bash
+set -a
+source .env
+set +a
+cd backend
+go run ./cmd/server
+```
+
+В другом терминале:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Vite проксирует `/api` и `/ws` на `localhost:8081`. Для входа с Telegram нужен HTTPS-туннель к Vite и соответствующий URL в BotFather. Для повседневной проверки используй полную Compose-сборку; она не требует публикации Vite.
+
+После изменения схемы/запросов:
+
+```bash
+cd backend
+sqlc generate
+go fmt ./...
+go test ./...
+go vet ./...
+```
+
+Новые изменения БД добавляй отдельной SQL-миграцией; не меняй уже применённую миграцию. Сгенерированные файлы sqlc хранятся в репозитории.
+
+## Проверки
+
+```bash
+cd backend
+go test ./...
+go vet ./...
+cd ../frontend
+npm run typecheck
+npm run build
+cd ..
+docker compose -f docker-compose.yml -f compose.test.yml run --build --rm tests
+```
+
+Unit-тесты проверяют подпись и возраст initData, сессии, парсер и границы кубиков, бой, права комнаты, валидацию действий и ошибки Ollama. Интеграционный тест создаёт отдельную временную схему, использует тестовый bot token и проверяет два WebSocket-клиента, лимиты, права, персонажей, готовность, старт, сохранение, откат при недоступной AI и чтение состояния новым экземпляром сервера. Тестовая схема удаляется; реальные кампании не затрагиваются.
+
+Опциональная проверка настоящей модели:
+
+```bash
+docker compose -f docker-compose.yml -f compose.test.yml run --build --rm \
+  -e OLLAMA_SMOKE_URL=http://host.docker.internal:11434 \
+  tests go test -v ./internal/ai -run TestLiveOllama
+```
+
+## Протокол и API
+
+После `POST /api/auth/telegram` с `{ "initData": "raw Telegram initData" }` frontend держит подписанный токен только в памяти и отправляет `Authorization: Bearer TOKEN`. Срок жизни исходного initData — один час, допускается 30 секунд рассинхронизации времени.
+
+WebSocket: `/ws/rooms/{id}`. Первое сообщение за 10 секунд:
+
+```json
+{"type":"auth","data":{"token":"SESSION_TOKEN"}}
+```
+
+Команды:
+
+```json
+{"type":"ready","data":{"ready":true}}
+{"type":"start_game","data":{}}
+{"type":"player_action","data":{"text":"Я атакую гоблина мечом"}}
+{"type":"roll_dice","data":{"notation":"2d6+3"}}
+{"type":"use_item","data":{"itemId":"UUID"}}
+```
+
+События `room_state`, `player_joined`, `player_left`, `character_updated`, `game_status_changed` сигнализируют о необходимости загрузить свежий snapshot через REST: `data.refresh=true`. Для хода `game_status_changed` также передаёт `data.processing`. `error` содержит `data.message`. Детали механики хранятся в typed payload журнала. Это намеренно компактный протокол MVP, а не отдельная рассылка каждого поля состояния.
+
+REST: `/api/me`, `/api/rooms` (GET/POST), `/api/rooms/join` (POST по коду), `/api/rooms/{id}` (GET/PATCH), `/{id}/join`, `/leave`, `/start`, `/pause` (POST), `/characters` (POST), `/characters/me`, `/members`, `/quests`, `/events` (GET). `PATCH /api/characters/{id}` позволяет владельцу персонажа изменить имя, расу и класс до старта; числовые характеристики не принимаются от клиента.

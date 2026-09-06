@@ -1,0 +1,5 @@
+# Development only: bind PostgreSQL to loopback for a locally running Go backend.
+services:
+  postgres:
+    ports:
+      - '127.0.0.1:5432:5432'

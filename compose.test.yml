@@ -1,0 +1,13 @@
+services:
+  tests:
+    build:
+      context: ./backend
+      target: build
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      TEST_DATABASE_URL: postgres://nocturna:${POSTGRES_PASSWORD}@postgres:5432/nocturna?sslmode=disable
+    command: [go, test, -v, ./...]
+    depends_on:
+      postgres:
+        condition: service_healthy
