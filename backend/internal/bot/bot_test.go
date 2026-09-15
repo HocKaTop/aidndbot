@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -76,5 +77,76 @@ func TestPollingTextReply(t *testing.T) {
 	b.Run(ctx)
 	if handled != 1 || sent != 1 {
 		t.Fatalf("handled=%d sent=%d", handled, sent)
+	}
+}
+
+func TestChatsRunIndependentlyAndKeepMessageOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started, otherDone, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var seen []string
+	b := &Bot{Handle: func(ctx context.Context, u auth.User, text string) (string, error) {
+		if u.ID == 1 && text == "first" {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		mu.Lock()
+		seen = append(seen, text)
+		mu.Unlock()
+		if u.ID == 2 {
+			close(otherDone)
+		}
+		return text, nil
+	}}
+	b.Client = &http.Client{Transport: fakeTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":true}`)), Header: make(http.Header)}, nil
+	})}
+	w := newChatWorkers(ctx, b)
+	enqueue := func(id int64, text string) {
+		var u update
+		data, _ := json.Marshal(map[string]any{"message": map[string]any{"from": map[string]any{"id": id}, "text": text}})
+		if err := json.Unmarshal(data, &u); err != nil {
+			t.Fatal(err)
+		}
+		w.enqueue(u)
+	}
+	enqueue(1, "first")
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("first message did not start")
+	}
+	enqueue(1, "second")
+	enqueue(2, "other room")
+	select {
+	case <-otherDone:
+	case <-ctx.Done():
+		t.Fatal("slow chat blocked another chat")
+	}
+	close(release)
+	for {
+		mu.Lock()
+		done := len(seen) == 3
+		mu.Unlock()
+		if done {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("queued message lost")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	w.wait.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(seen, ",") != "other room,first,second" {
+		t.Fatal("per-chat order broken", seen)
 	}
 }

@@ -99,7 +99,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/rooms/{id}/join", s.joinRoom)
 		r.Post("/api/rooms/{id}/leave", s.leaveRoom)
 		r.Patch("/api/rooms/{id}", s.settings)
- r.Delete("/api/rooms/{id}", s.deleteRoom)
+		r.Delete("/api/rooms/{id}", s.deleteRoom)
 		r.Get("/api/rooms/{id}/members", s.members)
 		r.Post("/api/rooms/{id}/characters", s.character)
 		r.Patch("/api/characters/{id}", s.editCharacter)

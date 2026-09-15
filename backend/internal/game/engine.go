@@ -17,11 +17,11 @@ type Action struct {
 	Status      string `json:"status,omitempty"`
 }
 type Result struct {
-	Type   string        `json:"type"`
-	Text   string        `json:"text"`
-	Roll   *Roll         `json:"roll,omitempty"`
-	Attack *AttackResult `json:"attack,omitempty"`
- Success *bool `json:"success,omitempty"`
+	Type    string        `json:"type"`
+	Text    string        `json:"text"`
+	Roll    *Roll         `json:"roll,omitempty"`
+	Attack  *AttackResult `json:"attack,omitempty"`
+	Success *bool         `json:"success,omitempty"`
 }
 
 func ValidateAction(s *State, user int64, a Action) error {
@@ -67,7 +67,7 @@ func ValidateAction(s *State, user int64, a Action) error {
 	case "UPDATE_QUEST":
 		found := false
 		for _, q := range s.Quests {
-			if q.ID == a.Target && q.Status=="ACTIVE" {
+			if q.ID == a.Target && q.Status == "ACTIVE" {
 				found = true
 			}
 		}
@@ -75,9 +75,13 @@ func ValidateAction(s *State, user int64, a Action) error {
 			return errors.New("некорректное обновление квеста")
 		}
 	case "START_COMBAT":
- if !s.HasEnemies()||s.Combat {return errors.New("нет противников для нового боя")}
- case "END_COMBAT":
- if !s.Combat||s.HasEnemies(){return errors.New("бой нельзя завершить, пока в сцене есть противники")}
+		if !s.HasEnemies() || s.Combat {
+			return errors.New("нет противников для нового боя")
+		}
+	case "END_COMBAT":
+		if !s.Combat || s.HasEnemies() {
+			return errors.New("бой нельзя завершить, пока в сцене есть противники")
+		}
 	case "ADD_ITEM":
 		if s.Hero(user) == nil || len(s.Hero(user).Inventory) >= 30 || strings.TrimSpace(a.Name) == "" {
 			return errors.New("предмет недоступен")
@@ -114,11 +118,16 @@ func Apply(s *State, user int64, a Action) (Result, error) {
 	switch a.Type {
 	case "ATTACK":
 		n := s.NPC(a.Target)
-		h:=s.Hero(user)
- sides:=4
- for _,item:=range h.Inventory{if item.Type=="WEAPON"&&item.Quantity>0{sides=8;break}}
- modifier:=Modifier(h.Stats.Strength)
- r, e := Attack(n.Name, n.HP, n.ArmorClass, modifier+2, fmt.Sprintf("1d%d%+d",sides,modifier))
+		h := s.Hero(user)
+		sides := 4
+		for _, item := range h.Inventory {
+			if item.Type == "WEAPON" && item.Quantity > 0 {
+				sides = 8
+				break
+			}
+		}
+		modifier := Modifier(h.Stats.Strength)
+		r, e := Attack(n.Name, n.HP, n.ArmorClass, modifier+2, fmt.Sprintf("1d%d%+d", sides, modifier))
 		if e != nil {
 			return out, e
 		}
@@ -126,15 +135,17 @@ func Apply(s *State, user int64, a Action) (Result, error) {
 		n.Alive = n.HP > 0
 		out.Attack = &r
 		out.Text = fmt.Sprintf("Атака: %s, попадание: %t, урон: %d, HP цели: %d", n.Name, r.Hit, r.Damage, n.HP)
-		if !s.HasEnemies() {s.Combat=false}
+		if !s.HasEnemies() {
+			s.Combat = false
+		}
 	case "SKILL_CHECK":
 		m, _ := SkillModifier(s.Hero(user).Stats, a.Skill)
- r, e := RollDice(fmt.Sprintf("1d20%+d",m))
+		r, e := RollDice(fmt.Sprintf("1d20%+d", m))
 		if e != nil {
 			return out, e
 		}
-success:=r.Total>=a.DC
- out.Success=&success
+		success := r.Total >= a.DC
+		out.Success = &success
 		out.Roll = &r
 		out.Text = fmt.Sprintf("Проверка %s: %d против %d; успех: %t", a.Skill, r.Total, a.DC, r.Total >= a.DC)
 	case "DICE_ROLL":
@@ -182,8 +193,10 @@ success:=r.Total>=a.DC
 		for i, it := range h.Inventory {
 			if it.ID == a.Target {
 				h.Inventory[i].Quantity--
- if h.Inventory[i].Quantity<=0{h.Inventory = append(h.Inventory[:i], h.Inventory[i+1:]...)}
- out.Text = "Удалена единица предмета: " + it.Name
+				if h.Inventory[i].Quantity <= 0 {
+					h.Inventory = append(h.Inventory[:i], h.Inventory[i+1:]...)
+				}
+				out.Text = "Удалена единица предмета: " + it.Name
 				break
 			}
 		}
@@ -195,8 +208,10 @@ func UseItem(s *State, user int64, id string) (Result, error) {
 	if h == nil || h.HP <= 0 {
 		return Result{}, errors.New("нет активного персонажа")
 	}
-	if h.HP>=h.MaxHP {return Result{},errors.New("здоровье уже полное; зелье сохранено")}
- for i, it := range h.Inventory {
+	if h.HP >= h.MaxHP {
+		return Result{}, errors.New("здоровье уже полное; зелье сохранено")
+	}
+	for i, it := range h.Inventory {
 		if it.ID == id && it.Type == "HEALING" && it.Quantity > 0 {
 			r, e := RollDice("2d4+2")
 			if e != nil {
@@ -236,21 +251,68 @@ func Retaliate(s *State, user int64) ([]Result, error) {
 
 // Skill checks precede their consequences. Failed checks never grant rewards or moves.
 // Work on the caller's private state; the enclosing transaction rolls back any error.
-func ApplyActions(s *State,user int64,actions []Action)([]Result,error){
- if len(actions)>4{return nil,errors.New("максимум четыре действия за ход")}
- mechanical:=0
- for i,a:=range actions {
-  switch a.Type{case "ATTACK","SKILL_CHECK","DICE_ROLL":mechanical++}
-  if a.Type=="SKILL_CHECK"&&i!=0{return nil,errors.New("проверка должна предшествовать своим последствиям")}
- }
- if mechanical>1{return nil,errors.New("максимум одна атака или проверка за ход")}
- results:=[]Result{}
- failed:=false
- for _,a:=range actions {
-  if failed{results=append(results,Result{Type:"ACTION_SKIPPED",Text:"Не выполнено после неудачной проверки: "+a.Type});continue}
-  result,err:=Apply(s,user,a);if err!=nil{return nil,err}
-  results=append(results,result)
-  if result.Success!=nil&&!*result.Success{failed=true}
- }
- return results,nil
+func validateActionOrder(actions []Action) error {
+	if len(actions) > 4 {
+		return errors.New("максимум четыре действия за ход")
+	}
+	mechanical := 0
+	for i, a := range actions {
+		switch a.Type {
+		case "ATTACK", "SKILL_CHECK", "DICE_ROLL":
+			mechanical++
+		}
+		if a.Type == "SKILL_CHECK" && i != 0 {
+			return errors.New("проверка должна предшествовать своим последствиям")
+		}
+	}
+	if mechanical > 1 {
+		return errors.New("максимум одна атака, проверка или бросок за ход; SKILL_CHECK и ATTACK уже бросают кубики, дополнительный DICE_ROLL не нужен")
+	}
+	return nil
+}
+
+// ValidateActions projects deterministic effects onto a copy, without rolling dice.
+// A corrected plan must be requested here, never after seeing a roll's result.
+func ValidateActions(state *State, user int64, actions []Action) error {
+	if err := validateActionOrder(actions); err != nil {
+		return err
+	}
+	projected := state.Clone()
+	for i, a := range actions {
+		if err := ValidateAction(&projected, user, a); err != nil {
+			return fmt.Errorf("действие %d (%s): %w", i+1, a.Type, err)
+		}
+		switch a.Type {
+		case "ATTACK", "SKILL_CHECK", "DICE_ROLL":
+			// Validate all potential consequences, but do not predict success/death.
+		default:
+			if _, err := Apply(&projected, user, a); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func ApplyActions(s *State, user int64, actions []Action) ([]Result, error) {
+	if err := ValidateActions(s, user, actions); err != nil {
+		return nil, err
+	}
+	results := []Result{}
+	failed := false
+	for _, a := range actions {
+		if failed {
+			results = append(results, Result{Type: "ACTION_SKIPPED", Text: "Не выполнено после неудачной проверки: " + a.Type})
+			continue
+		}
+		result, err := Apply(s, user, a)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, result)
+		if result.Success != nil && !*result.Success {
+			failed = true
+		}
+	}
+	return results, nil
 }

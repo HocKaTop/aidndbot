@@ -59,6 +59,9 @@ export function SettingsForm({
           {field("rules", "Правила", true)}
           {field("gmStyle", "Стиль ведущего")}
           {field("ollamaModel", "Модель Ollama")}
+          <small>
+            Оставь модель пустой, чтобы использовать настроенную на сервере.
+          </small>
           <label>
             Максимум игроков
             <input

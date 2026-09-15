@@ -693,3 +693,35 @@ nav button.selected {
     scroll-behavior: auto !important;
   }
 }
+
+.delete-dialog {
+  margin: auto;
+  width: min(92vw, 460px);
+  border: 1px solid #ffffff25;
+  border-radius: 15px;
+  padding: 24px;
+  background: var(--panel);
+  color: inherit;
+}
+.delete-dialog::backdrop {
+  background: #000a;
+}
+.delete-dialog form {
+  margin-top: 20px;
+}
+button.danger {
+  background: #74382e;
+  color: #fff1ed;
+}
+button.danger:hover:not(:disabled) {
+  background: #904537;
+}
+.action-examples {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.action-examples button {
+  text-align: left;
+  white-space: normal;
+}

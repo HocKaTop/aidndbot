@@ -13,6 +13,34 @@ services:
       timeout: 3s
       retries: 15
     restart: unless-stopped
+  
+  ollama:
+    container_name: ollama
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    expose:
+      - 11434
+    gpus: all
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  ollama-init:
+   container_name: ollama-init
+   image: ollama/ollama:latest
+   depends_on:
+    ollama:
+      condition: service_healthy
+   environment:
+    OLLAMA_HOST: http://ollama:11434
+   command: ["pull", "qwen3.5:9b"]
+   restart: no
+    
+
   backend:
     build: ./backend
     environment:
@@ -23,6 +51,7 @@ services:
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
       JWT_SECRET: ${JWT_SECRET:?Run python3 scripts/setup_env.py first}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-16384}
       DEFAULT_OLLAMA_MODEL: ${DEFAULT_OLLAMA_MODEL:-qwen3:8b}
       BOT_ENABLED: ${BOT_ENABLED:-false}
       HTTP_ADDR: :8081
@@ -41,3 +70,4 @@ services:
     restart: unless-stopped
 volumes:
   postgres_data:
+  ollama:

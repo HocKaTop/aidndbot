@@ -23,10 +23,12 @@ import {
   Sparkles,
   Swords,
   Users,
+  Trash2,
   X,
 } from "lucide-react";
-import { api, setToken } from "./api";
+import { api, setToken, ApiError } from "./api";
 import { useRoomSocket } from "./useRoomSocket";
+import { DeleteRoomDialog } from "./DeleteRoomDialog";
 import { SettingsForm, HeroCard } from "./components";
 import type { GameEvent, Room, Settings, User } from "./types";
 const defaults: Settings = {
@@ -37,9 +39,23 @@ const defaults: Settings = {
   rules: "Упрощённая fantasy RPG",
   difficulty: "Обычная",
   gmStyle: "Атмосферный, с выбором для игроков",
-  ollamaModel: "qwen3:8b",
+  ollamaModel: "",
   maxPlayers: 6,
 };
+const quickAdventure: Settings = {
+  ...defaults,
+  name: "Последний фонарь",
+  worldDescription:
+    "Короткое приключение для новичков на одну сессию. Отряд прибывает в деревню Тихий Брод: единственный фонарь, защищающий мост от тумана, погас. До заката нужно найти пропавший огненный камень и вернуть свет. Начало — у моста, где смотрительница Мира просит помощи. Она видела следы к старой мельнице. План: разговор и осмотр моста, исследование мельницы с простой загадкой, встреча с напуганным похитителем, возвращение камня. Дай возможность договориться или вступить в короткий бой по выбору игроков. Раскрывай тайну постепенно, начни без боя. После возвращения камня заверши квест и расскажи эпилог.",
+  tone: "Таинственный, уютный, с надеждой",
+  gmStyle:
+    "Короткие сцены, понятная цель и выбор для новичков. Не решай за игроков.",
+};
+const actionExamples = [
+  "Я осматриваюсь и ищу, что поможет нам достичь цели.",
+  "Я внимательно прислушиваюсь: что происходит рядом?",
+  "Я обсуждаю с отрядом, с чего нам лучше начать.",
+];
 const labels: Record<string, string> = {
   WAITING: "Сбор отряда",
   PLAYING: "Приключение",
@@ -60,9 +76,21 @@ export default function App() {
     [text, setText] = useState(""),
     [dice, setDice] = useState("d20"),
     [notice, setNotice] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<Room | null>(null);
   const active = useRef<string | null>(null);
   const refreshSequence = useRef(0);
   const bottom = useRef<HTMLDivElement>(null);
+  const previousRoom = useRef<{ id: string; status: string } | null>(null);
+  useEffect(() => {
+    if (
+      room?.id === previousRoom.current?.id &&
+      previousRoom.current?.status === "WAITING" &&
+      room?.status === "PLAYING"
+    ) {
+      setTab("game");
+    }
+    previousRoom.current = room ? { id: room.id, status: room.status } : null;
+  }, [room?.id, room?.status]);
   const run = async (fn: () => Promise<void>) => {
     setError("");
     setBusy(true);
@@ -103,6 +131,19 @@ export default function App() {
       live = false;
     };
   }, []);
+  const removed = useCallback((message: string) => {
+    active.current = null;
+    refreshSequence.current++;
+    setRoom(null);
+    setEvents([]);
+    setDeleteTarget(null);
+    setScreen("home");
+    setError("");
+    setNotice(message);
+    void api<Room[]>("/rooms")
+      .then(setRooms)
+      .catch((e) => setError(e.message));
+  }, []);
   const refresh = useCallback(() => {
     const rid = active.current;
     if (!rid) return;
@@ -117,12 +158,19 @@ export default function App() {
           setEvents(e);
         }
       })
-      .catch((e) => setError(e.message));
-  }, []);
-  const { status, processing, send } = useRoomSocket(
+      .catch((e) => {
+        if (active.current !== rid || sequence !== refreshSequence.current)
+          return;
+        if (e instanceof ApiError && (e.status === 404 || e.status === 403))
+          removed("Комната удалена или больше недоступна");
+        else setError(e.message);
+      });
+  }, [removed]);
+  const { status, processing, actor, send } = useRoomSocket(
     room?.id,
     refresh,
     setError,
+    removed,
   );
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -133,22 +181,53 @@ export default function App() {
     setScreen("room");
     setTab(r.status === "WAITING" ? "party" : "game");
     setEvents([]);
+    setText("");
     refresh();
   };
   const home = () => {
     active.current = null;
     setRoom(null);
+    setDeleteTarget(null);
+    setText("");
     setScreen("home");
     void run(async () => setRooms(await api<Room[]>("/rooms")));
   };
   const owner = !!room && room.ownerId === user?.id;
   const hero = room?.state.characters.find((h) => h.userId === user?.id);
   const waiting = room?.status === "WAITING";
+  const combatHero = room?.state.combat
+    ? room.state.characters.find(
+        (h) =>
+          h.userId === room.state.combatOrder?.[room.state.combatIndex ?? 0],
+      )
+    : undefined;
+  const myTurn = !combatHero || combatHero.userId === user?.id;
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!room?.state.combat) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [room?.state.combat]);
+  const skipWait = Math.max(
+    0,
+    Math.ceil(
+      (Date.parse(room?.state.combatTurnSince ?? "") + 60000 - now) / 1000,
+    ),
+  );
+  const pendingMembers =
+    room?.members.filter(
+      (m) =>
+        !m.ready ||
+        !room.state.characters.some((h) => h.userId === m.userId && h.hp > 0),
+    ) ?? [];
+  const applyRoom = (next: Room) => {
+    if (active.current === next.id) setRoom(next);
+  };
   const createHero = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const data = new FormData(e.currentTarget);
     void run(async () => {
-      setRoom(
+      applyRoom(
         await api<Room>(
           `/rooms/${room!.id}/characters`,
           "POST",
@@ -159,6 +238,7 @@ export default function App() {
   };
   const action = (e: FormEvent) => {
     e.preventDefault();
+    if (!myTurn || processing || room?.status !== "PLAYING") return;
     if (text.trim() && send("player_action", { text })) {
       setText("");
     }
@@ -241,7 +321,11 @@ export default function App() {
                 <br />
                 который помнит ваши приключения.
               </p>
-              <button className="primary" onClick={() => setScreen("create")}>
+              <button
+                className="primary"
+                disabled={busy}
+                onClick={() => setScreen("create")}
+              >
                 <Plus size={18} />
                 Новая кампания
               </button>
@@ -249,6 +333,28 @@ export default function App() {
                 <Swords />
                 <span>XX</span>
               </div>
+            </section>
+            <section className="panel stack">
+              <div className="eyebrow">
+                Первое приключение · можно одному или с друзьями
+              </div>
+              <h2>Последний фонарь</h2>
+              <p>
+                Над деревней сгущается туман. Найдите пропавший огненный камень
+                и верните свет до заката. Мир и завязка уже подготовлены —
+                осталось собрать отряд.
+              </p>
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() =>
+                  void run(async () => {
+                    open(await api<Room>("/rooms", "POST", quickAdventure));
+                  })
+                }
+              >
+                <Sparkles size={18} /> Быстрое приключение
+              </button>
             </section>
             <form
               className="join panel"
@@ -357,6 +463,15 @@ export default function App() {
                 <div className="eyebrow">{room.state.settings.setting}</div>
                 <h1>{room.state.settings.name}</h1>
               </div>
+              {owner && (
+                <button
+                  aria-label="Удалить комнату"
+                  title="Удалить комнату"
+                  onClick={() => setDeleteTarget(room)}
+                >
+                  <Trash2 size={20} />
+                </button>
+              )}
               {owner && waiting && (
                 <button
                   aria-label="Настройки комнаты"
@@ -373,6 +488,100 @@ export default function App() {
               {labels[room.status]}
               {room.state.combat && <span className="combat-label">Бой</span>}
             </div>
+            {waiting && (
+              <section className="panel stack" aria-label="Подготовка отряда">
+                <h2>
+                  {processing
+                    ? "Мастер готовит вступление…"
+                    : "До первого приключения"}
+                </h2>
+                <p>
+                  Создай героя, пригласи друзей по коду и нажми «Я готов к
+                  приключению». Можно играть одному. Когда все готовы, владелец
+                  начинает игру — мастер создаст сцену и первую цель.
+                </p>
+                {pendingMembers.length > 0 ? (
+                  <p role="status">
+                    Ждём:{" "}
+                    {pendingMembers
+                      .map((m) => {
+                        const h = room.state.characters.find(
+                          (c) => c.userId === m.userId,
+                        );
+                        return `${m.name} — ${!h ? "создать героя" : h.hp <= 0 ? "нужен живой герой" : "подтвердить готовность"}`;
+                      })
+                      .join("; ")}
+                  </p>
+                ) : (
+                  <p role="status">
+                    Все готовы.{" "}
+                    {owner ? "Можно начинать!" : "Ждём старта от владельца."}
+                  </p>
+                )}
+                {tab !== "party" && (
+                  <button className="secondary" onClick={() => setTab("party")}>
+                    Открыть отряд
+                  </button>
+                )}
+              </section>
+            )}
+            {processing && actor && (
+              <p className="notice banner" role="status">
+                Мастер обрабатывает действие: {actor}
+              </p>
+            )}
+            {combatHero && (
+              <section className="panel stack" aria-label="Очередь боя">
+                <h2>
+                  Раунд {room.state.combatRound} · Ходит {combatHero.name}
+                </h2>
+                <p>
+                  {room.state.combatOrder
+                    ?.map(
+                      (id) =>
+                        room.state.characters.find(
+                          (h) => h.userId === id && h.hp > 0,
+                        )?.name,
+                    )
+                    .filter(Boolean)
+                    .join(" → ")}
+                </p>
+                <p>
+                  После каждого хода отвечает противник. При обрыве связи
+                  очередь сохраняется. Владелец может пропустить ход после
+                  минуты ожидания.
+                </p>
+                {myTurn && (
+                  <button
+                    className="secondary"
+                    disabled={
+                      processing ||
+                      status !== "online" ||
+                      room.status !== "PLAYING"
+                    }
+                    onClick={() => send("pass_turn", {})}
+                  >
+                    Пропустить мой ход
+                  </button>
+                )}
+                {owner && !myTurn && (
+                  <button
+                    className="secondary"
+                    disabled={
+                      processing ||
+                      status !== "online" ||
+                      room.status !== "PLAYING" ||
+                      skipWait !== 0
+                    }
+                    onClick={() => send("skip_turn", { turn: room.state.turn })}
+                  >
+                    {skipWait > 0
+                      ? `Ждём игрока · ${skipWait} с`
+                      : `Пропустить ход: ${combatHero.name}`}
+                  </button>
+                )}
+              </section>
+            )}
             {tab === "party" && (
               <>
                 <section className="panel">
@@ -405,7 +614,11 @@ export default function App() {
                           <Check size={18} className="green" />
                         ) : (
                           <span className="pill">
-                            {waiting ? "Готовится" : "В отряде"}
+                            {waiting
+                              ? h
+                                ? "Ждём готовности"
+                                : "Нет героя"
+                              : "В отряде"}
                           </span>
                         )}
                       </div>
@@ -425,6 +638,11 @@ export default function App() {
                     <Copy size={16} />
                     Пригласить друзей · {room.code}
                   </button>
+                  <p>
+                    Чтобы получать события в Telegram, напиши боту{" "}
+                    <code>/room {room.code}</code>. Уведомления можно выключить
+                    командой <code>/mute</code>.
+                  </p>
                 </section>
                 <section className="panel">
                   <div className="eyebrow">Этот мир</div>
@@ -495,29 +713,39 @@ export default function App() {
                       : "Я готов к приключению"}
                   </button>
                 )}
-                {owner && (
+                {owner && room.status !== "FINISHED" && (
                   <button
                     className="primary full"
                     disabled={
-                      busy || processing || !room.state.characters.length
+                      busy ||
+                      processing ||
+                      status !== "online" ||
+                      !room.state.characters.length ||
+                      (waiting && pendingMembers.length > 0)
                     }
-                    onClick={() =>
+                    onClick={() => {
+                      if (room.status !== "PLAYING") {
+                        if (send("start_game", {})) setTab("game");
+                        return;
+                      }
                       void run(async () => {
-                        setRoom(
+                        applyRoom(
                           await api<Room>(
                             `/rooms/${room.id}/${room.status === "PLAYING" ? "pause" : "start"}`,
                             "POST",
                           ),
                         );
                         setTab("game");
-                      })
-                    }
+                      });
+                    }}
                   >
-                    {room.status === "PLAYING"
-                      ? "Поставить на паузу"
-                      : room.status === "PAUSED"
-                        ? "Продолжить кампанию"
-                        : "Начать приключение"}
+                    {processing && waiting
+                      ? "Готовим вступление…"
+                      : room.status === "PLAYING"
+                        ? "Поставить на паузу"
+                        : room.status === "PAUSED"
+                          ? "Продолжить кампанию"
+                          : "Начать приключение"}
                     <ArrowRight size={18} />
                   </button>
                 )}
@@ -536,6 +764,21 @@ export default function App() {
                 )}
               </>
             )}
+            {room.status === "FINISHED" && (
+              <section className="panel">
+                <h2>Кампания завершена</h2>
+                <p>
+                  Весь отряд пал. История сохранена; можно перечитать журнал или
+                  начать новую кампанию.
+                </p>
+              </section>
+            )}
+            {hero && hero.hp <= 0 && room.status !== "FINISHED" && (
+              <p className="error">
+                Твой персонаж пал и больше не может действовать. Ты можешь
+                следить за приключением отряда.
+              </p>
+            )}
             {tab === "game" && (
               <>
                 {room.state.scene ? (
@@ -546,6 +789,16 @@ export default function App() {
                     </div>
                     <h2>{room.state.scene.title}</h2>
                     <p>{room.state.scene.description}</p>
+                    {room.state.quests
+                      .filter((q) => q.status === "ACTIVE")
+                      .slice(0, 1)
+                      .map((q) => (
+                        <div key={q.id}>
+                          <div className="eyebrow">Ближайшая цель</div>
+                          <h3>{q.title}</h3>
+                          <p>{q.description}</p>
+                        </div>
+                      ))}
                   </section>
                 ) : (
                   <section className="empty">
@@ -556,7 +809,7 @@ export default function App() {
                     <p>
                       {waiting
                         ? "Создайте персонажей во вкладке «Отряд»."
-                        : "Напиши, как начинается ваше приключение."}
+                        : "Мастер готовит место встречи и первую цель отряда."}
                     </p>
                   </section>
                 )}
@@ -594,12 +847,36 @@ export default function App() {
                   {processing && (
                     <article className="event gm thinking">
                       <Sparkles size={16} />
-                      Ведущий обдумывает ход…
+                      {actor
+                        ? `Ведущий обдумывает действие: ${actor}…`
+                        : "Ведущий обдумывает ход…"}
                     </article>
                   )}
                   <div ref={bottom} />
                 </div>
                 <form className="composer" onSubmit={action}>
+                  {room.status === "PLAYING" &&
+                    room.state.turn === 0 &&
+                    hero &&
+                    hero.hp > 0 && (
+                      <div className="action-examples">
+                        <p>
+                          Что попробовать? Выбери пример и дополни его или
+                          напиши своё действие.
+                        </p>
+                        {actionExamples.map((example) => (
+                          <button
+                            type="button"
+                            className="secondary"
+                            key={example}
+                            disabled={processing}
+                            onClick={() => setText(example)}
+                          >
+                            {example}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   <textarea
                     aria-label="Действие персонажа"
                     placeholder="Что ты делаешь?"
@@ -609,6 +886,7 @@ export default function App() {
                     disabled={
                       waiting ||
                       room.status !== "PLAYING" ||
+                      !myTurn ||
                       !hero ||
                       hero.hp <= 0
                     }
@@ -643,6 +921,7 @@ export default function App() {
                       aria-label="Отправить действие"
                       disabled={
                         processing ||
+                        !myTurn ||
                         status !== "online" ||
                         room.status !== "PLAYING" ||
                         !hero ||
@@ -675,9 +954,11 @@ export default function App() {
                           <button
                             disabled={
                               processing ||
+                              !myTurn ||
                               status !== "online" ||
                               room.status !== "PLAYING" ||
-                              hero.hp <= 0
+                              hero.hp <= 0 ||
+                              hero.hp >= hero.maxHp
                             }
                             onClick={() => send("use_item", { itemId: it.id })}
                           >
@@ -773,6 +1054,22 @@ export default function App() {
             </button>
           ))}
         </nav>
+      )}
+      {deleteTarget && (
+        <DeleteRoomDialog
+          room={deleteTarget}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={async (code) => {
+            const rid = deleteTarget.id;
+            try {
+              await api(`/rooms/${rid}`, "DELETE", { code });
+            } catch (e) {
+              if (!(e instanceof ApiError && e.status === 404)) throw e;
+            }
+            if (active.current === rid) removed("Комната удалена");
+            setDeleteTarget(null);
+          }}
+        />
       )}
     </div>
   );

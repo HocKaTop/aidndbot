@@ -19,9 +19,13 @@ const textHelp = `Можно играть прямо здесь, без Mini App
 
 /create Название — новая кампания и готовый герой
 /join КОД — войти в кампанию друзей до старта
+/ready — подтвердить готовность; /unready — ещё готовлюсь
 /play — начать или продолжить игру (владелец)
 /state — сцена, отряд, HP и инвентарь
 /history — последние события
+/pass — пропустить свой ход в бою
+/skip — пропустить задержавшегося игрока после минуты (владелец)
+/mute и /unmute — выключить или включить уведомления выбранной кампании
 /roll d20 — бросить кубик
 /use 1 — использовать предмет по номеру из /state
 /pause — поставить игру на паузу
@@ -29,7 +33,7 @@ const textHelp = `Можно играть прямо здесь, без Mini App
 /rooms — мои кампании
 /room КОД — переключиться на свою кампанию
 
-После /play пиши действия обычными сообщениями, например: «Я вхожу в заброшенную таверну». Ответ ведущего может занять около полуминуты. Другие игроки могут посмотреть твой ход через /history.`
+Создайте героев и отправьте /ready каждый. После /play мастер сам даст вступление и первую цель. Затем пиши действия обычными сообщениями, например: «Я осматриваюсь в поисках зацепок». Ответ ведущего может занять около полуминуты. Участники выбранной кампании получают события автоматически. /mute — выключить уведомления; /history — перечитать события.`
 
 // TextMessage accepts identities exclusively from Telegram Bot API updates.
 // It is not exposed as an HTTP endpoint and does not bypass Mini App authentication.
@@ -49,6 +53,8 @@ func (s *Server) TextMessage(ctx context.Context, user auth.User, text string) (
 	return "Не удалось выполнить действие. Попробуй ещё раз; /state покажет сохранённое состояние.", nil
 }
 func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (string, error) {
+	receipt := &commandReceipt{Author: user.ID}
+	ctx = context.WithValue(ctx, receiptKey{}, receipt)
 	if user.ID <= 0 {
 		return "", denied()
 	}
@@ -56,8 +62,8 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 	if text == "" {
 		return textHelp, nil
 	}
-	if len(text) > 2500 {
-		return "Сократи сообщение до 2500 байт.", nil
+	if utf8.RuneCountInString(text) > 1000 {
+		return "Сократи сообщение до 1000 символов.", nil
 	}
 	q := store.New(s.Pool)
 	if err := q.UpsertUser(ctx, store.UpsertUserParams{ID: user.ID, FirstName: user.FirstName, Username: user.Username}); err != nil {
@@ -76,7 +82,7 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Кампания «%s» создана. Герой %s готов: 20 HP.\n\nКод для друзей: %s\nОни могут написать боту /join %s\n\nНапиши /play, чтобы начать. Можно играть одному.", room.State.Settings.Name, hero.Name, room.Code, room.Code), nil
+		return fmt.Sprintf("Кампания «%s» создана. Герой %s создан: 20 HP.\n\nКод для друзей: %s\nОни могут написать боту /join %s\n\nКаждый игрок должен отправить /ready, затем владелец — /play. Можно играть одному.", room.State.Settings.Name, hero.Name, room.Code, room.Code), nil
 	case "/rooms":
 		rows, err := q.ListRooms(ctx, user.ID)
 		if err != nil {
@@ -131,11 +137,11 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		if err != nil {
 			return "", err
 		}
-		return describeRoom(room, user.ID), nil
+		return describeRoom(room, user.ID) + "\nУведомления этой кампании: /unmute — включить, /mute — выключить.", nil
 	}
 	if isCommand {
 		switch command {
-		case "/play", "/pause", "/state", "/history", "/roll", "/use", "/delete":
+		case "/play", "/pause", "/state", "/history", "/roll", "/use", "/delete", "/ready", "/unready", "/pass", "/skip", "/mute", "/unmute":
 		default:
 			return "Неизвестная команда. /help — список команд.", nil
 		}
@@ -150,12 +156,39 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		return "", err
 	}
 	switch command {
+	case "/mute", "/unmute":
+		_, err = s.Pool.Exec(ctx, "UPDATE bot_sessions SET notifications=$2 WHERE user_id=$1", user.ID, command == "/unmute")
+		if err != nil {
+			return "", err
+		}
+		if command == "/mute" {
+			return "Уведомления выключены. /unmute — включить.", nil
+		}
+		return "Буду присылать новые события выбранной кампании. /mute — выключить.", nil
+	case "/ready", "/unready":
+		cmd := Command{Type: "ready"}
+		cmd.Data.Ready = command == "/ready"
+		if err = s.command(ctx, rid, user.ID, cmd); err != nil {
+			return "", err
+		}
+		s.Hub.Publish(rid, "room_state")
+		room, err = s.load(ctx, rid, user.ID)
+		if err != nil {
+			return "", err
+		}
+		return describeRoom(room, user.ID), nil
 	case "/delete":
- if !CanManage(room.OwnerID,user.ID){return "",denied()}
- if arg=="" {return fmt.Sprintf("Удалить «%s» вместе со всеми персонажами и историей? Это нельзя отменить. Для подтверждения отправь:\n/delete %s",room.State.Settings.Name,room.Code),nil}
- if err=s.deleteCampaign(ctx,rid,user.ID,arg);err!=nil{return "",err}
- return "Комната удалена. /rooms — оставшиеся кампании; /create — новая.",nil
- case "/state":
+		if !CanManage(room.OwnerID, user.ID) {
+			return "", denied()
+		}
+		if arg == "" {
+			return fmt.Sprintf("Удалить «%s» вместе со всеми персонажами и историей? Это нельзя отменить. Для подтверждения отправь:\n/delete %s", room.State.Settings.Name, room.Code), nil
+		}
+		if err = s.deleteCampaign(ctx, rid, user.ID, arg); err != nil {
+			return "", err
+		}
+		return "Комната удалена. /rooms — оставшиеся кампании; /create — новая.", nil
+	case "/state":
 		return describeRoom(room, user.ID), nil
 	case "/history":
 		return s.textHistory(ctx, rid)
@@ -164,7 +197,10 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 			return "", err
 		}
 		s.Hub.Publish(rid, "game_status_changed")
-		return "Игра началась. Напиши первое действие, например: «Я открываю дверь таверны и осматриваюсь».", nil
+		if room.Status == "PAUSED" {
+			return "Кампания продолжается. /state — текущая сцена и цель.", nil
+		}
+		return renderTextEvents(receipt.Events) + "\n\nЧто ты делаешь? Например: «Я осматриваюсь в поисках зацепок».", nil
 	case "/pause":
 		_, err = s.mutate(ctx, rid, user.ID, false, func(q *store.Queries, r *Room) error {
 			if !CanManage(r.OwnerID, user.ID) {
@@ -174,7 +210,7 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 				return bad("Игра не запущена")
 			}
 			r.Status = "PAUSED"
-			return nil
+			return s.addEvent(ctx, q, rid, user.ID, "GAME_PAUSED", game.Result{Type: "GAME_PAUSED", Text: "Владелец поставил кампанию на паузу."})
 		})
 		if err != nil {
 			return "", err
@@ -188,6 +224,11 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 	cmd := Command{Type: "player_action"}
 	cmd.Data.Text = text
 	switch command {
+	case "/pass":
+		cmd.Type = "pass_turn"
+	case "/skip":
+		cmd.Type = "skip_turn"
+		cmd.Data.Turn = room.State.Turn
 	case "/roll":
 		cmd.Type = "roll_dice"
 		cmd.Data.Notation = arg
@@ -203,30 +244,12 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		cmd.Type = "use_item"
 		cmd.Data.ItemID = hero.Inventory[n-1].ID
 	}
-	before, err := s.eventList(ctx, rid)
-	if err != nil {
-		return "", err
-	}
-	known := make(map[string]bool, len(before))
-	for _, event := range before {
-		known[event.ID] = true
-	}
 	// Shares the engine and PostgreSQL row lock with WebSocket/REST actions.
 	if err = s.command(ctx, rid, user.ID, cmd); err != nil {
 		return "", err
 	}
 	s.Hub.Publish(rid, "room_state")
-	after, err := s.eventList(ctx, rid)
-	if err != nil {
-		return "", err
-	}
-	fresh := []Event{}
-	for _, event := range after {
-		if !known[event.ID] {
-			fresh = append(fresh, event)
-		}
-	}
-	return renderTextEvents(fresh), nil
+	return renderTextEvents(receipt.Events), nil
 }
 func parseTextCommand(text string) (command, arg string, isCommand bool) {
 	if !strings.HasPrefix(text, "/") {
@@ -243,12 +266,25 @@ func describeRoom(r Room, user int64) string {
 	var out strings.Builder
 	labels := map[string]string{"WAITING": "сбор отряда", "PLAYING": "игра идёт", "PAUSED": "пауза", "FINISHED": "завершена"}
 	fmt.Fprintf(&out, "%s · %s\nКод: %s\n", r.State.Settings.Name, labels[r.Status], r.Code)
+	if r.Activity.Processing {
+		fmt.Fprintf(&out, "\nМастер обрабатывает действие: %s.\n", r.Activity.Name)
+	}
+	if h := r.State.CombatHero(); h != nil {
+		fmt.Fprintf(&out, "\nРаунд %d. Сейчас ходит %s. /pass — пропустить свой ход. Владелец может использовать /skip после минуты ожидания.\n", r.State.CombatRound, h.Name)
+	}
 	if r.State.Scene != nil {
 		fmt.Fprintf(&out, "\n%s\n%s\n", r.State.Scene.Title, r.State.Scene.Description)
 	}
 	out.WriteString("\nОтряд:\n")
 	for _, h := range r.State.Characters {
 		fmt.Fprintf(&out, "%s: %d/%d HP\n", h.Name, h.HP, h.MaxHP)
+	}
+	if r.Status == "WAITING" {
+		if err := lobbyReady(&r); err != nil {
+			fmt.Fprintf(&out, "\n%s\n", err.(*apiError).Message)
+		} else {
+			out.WriteString("\nВсе готовы. Владелец может отправить /play.\n")
+		}
 	}
 	if h := r.State.Hero(user); h != nil {
 		out.WriteString("\nТвой инвентарь:\n")

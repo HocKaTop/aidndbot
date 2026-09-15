@@ -1,6 +1,10 @@
 package game
 
-import "github.com/google/uuid"
+import (
+	"github.com/google/uuid"
+	"slices"
+	"time"
+)
 
 type Settings struct {
 	Name             string `json:"name"`
@@ -66,18 +70,38 @@ type Scene struct {
 	Location    string `json:"location"`
 }
 type State struct {
-	Settings   Settings    `json:"settings"`
-	Characters []Character `json:"characters"`
-	NPCs       []NPC       `json:"npcs"`
-	Quests     []Quest     `json:"quests"`
-	Scene      *Scene      `json:"scene"`
-	Combat     bool        `json:"combat"`
-	Summary    string      `json:"summary"`
-	Turn       int         `json:"turn"`
+	Settings        Settings    `json:"settings"`
+	Characters      []Character `json:"characters"`
+	NPCs            []NPC       `json:"npcs"`
+	Quests          []Quest     `json:"quests"`
+	Scene           *Scene      `json:"scene"`
+	Combat          bool        `json:"combat"`
+	CombatOrder     []int64     `json:"combatOrder,omitempty"`
+	CombatIndex     int         `json:"combatIndex"`
+	CombatRound     int         `json:"combatRound"`
+	CombatTurnSince time.Time   `json:"combatTurnSince"`
+	Summary         string      `json:"summary"`
+	Turn            int         `json:"turn"`
 }
 
 func NewState(s Settings) State {
 	return State{Settings: s, Characters: []Character{}, NPCs: []NPC{}, Quests: []Quest{}}
+}
+
+// Clone isolates speculative validation from the authoritative state.
+func (s State) Clone() State {
+	s.CombatOrder = slices.Clone(s.CombatOrder)
+	s.Characters = slices.Clone(s.Characters)
+	for i := range s.Characters {
+		s.Characters[i].Inventory = slices.Clone(s.Characters[i].Inventory)
+	}
+	s.NPCs = slices.Clone(s.NPCs)
+	s.Quests = slices.Clone(s.Quests)
+	if s.Scene != nil {
+		scene := *s.Scene
+		s.Scene = &scene
+	}
+	return s
 }
 func NewCharacter(user int64, name, race, class string) Character {
 	return Character{ID: uuid.NewString(), UserID: user, Name: name, Race: race, Class: class, Level: 1, HP: 20, MaxHP: 20, ArmorClass: 13, Stats: Stats{14, 12, 14, 12, 10, 10}, Inventory: []Item{{uuid.NewString(), "Зелье лечения", "Восстанавливает 2d4+2 HP", 2, "HEALING"}, {uuid.NewString(), "Меч", "Урон 1d8+2", 1, "WEAPON"}}}
@@ -99,16 +123,28 @@ func (s *State) NPC(id string) *NPC {
 	return nil
 }
 
-func(s *State)Present(n NPC)bool {
- if s.Scene==nil {return n.Location==""}
- return n.Location==s.Scene.Location
+func (s *State) Present(n NPC) bool {
+	if s.Scene == nil {
+		return n.Location == ""
+	}
+	return n.Location == s.Scene.Location
 }
-func(s *State)HasEnemies()bool {
- for _,n:=range s.NPCs {if n.Alive&&n.Disposition=="hostile"&&s.Present(n){return true}}
- return false
+func (s *State) HasEnemies() bool {
+	for _, n := range s.NPCs {
+		if n.Alive && n.Disposition == "hostile" && s.Present(n) {
+			return true
+		}
+	}
+	return false
 }
-func(s *State)PartyDefeated()bool {
- if len(s.Characters)==0{return false}
- for _,h:=range s.Characters{if h.HP>0{return false}}
- return true
+func (s *State) PartyDefeated() bool {
+	if len(s.Characters) == 0 {
+		return false
+	}
+	for _, h := range s.Characters {
+		if h.HP > 0 {
+			return false
+		}
+	}
+	return true
 }

@@ -33,6 +33,9 @@ func (f *fakeAI) GenerateTurn(ctx context.Context, model string, in ai.Input) (a
 	if f.fail {
 		return ai.Output{}, errors.New("offline")
 	}
+	if in.Opening {
+		return openingOutput(), nil
+	}
 	if in.Results != nil {
 		return ai.Output{Narrative: "Вы вступили в заброшенную таверну.", Actions: []game.Action{}, Memory: []string{}}, nil
 	}
@@ -186,6 +189,12 @@ func TestIntegration(t *testing.T) {
 	request("PATCH", characterPath, owner, map[string]int{"hp": 999}, 400, nil)
 	request("PATCH", characterPath, owner, map[string]string{"name": "Олег"}, 200, &room)
 	request("POST", path+"/start", player, nil, 403, nil)
+	request("POST", path+"/start", owner, nil, 400, nil)
+	ready := Command{Type: "ready"}
+	ready.Data.Ready = true
+	if e := s.command(ctx, room.ID, 1, ready); e != nil {
+		t.Fatal(e)
+	}
 	request("POST", path+"/start", owner, nil, 200, &room)
 	cmd := Command{Type: "player_action"}
 	cmd.Data.Text = "Входим в таверну"
@@ -207,7 +216,7 @@ func TestIntegration(t *testing.T) {
 	}
 	var events []Event
 	request("GET", path+"/events", owner, nil, 200, &events)
-	if len(events) != 4 {
+	if len(events) != 7 {
 		t.Fatalf("unexpected event count: %d", len(events))
 	}
 	restored := &Server{Config: s.Config, Pool: pool}
@@ -216,6 +225,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatal("restore failed", e)
 	}
 	request("POST", path+"/pause", owner, nil, 200, &room)
+	model.fail = false
 	cmd.Type = "roll_dice"
 	cmd.Data.Notation = "d20"
 	if e = s.command(ctx, room.ID, 1, cmd); e == nil {
@@ -244,7 +254,16 @@ func TestIntegration(t *testing.T) {
 		t.Fatal("text player started owner's campaign")
 	}
 	message, err = s.TextMessage(ctx, textOwner, "/play")
-	if err != nil || !strings.Contains(message, "Игра началась") {
+	if err != nil || !strings.Contains(message, "Ждём отряд") {
+		t.Fatal("started before readiness", message, err)
+	}
+	for _, user := range []auth.User{textOwner, textPlayer} {
+		if _, err = s.TextMessage(ctx, user, "/ready"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	message, err = s.TextMessage(ctx, textOwner, "/play")
+	if err != nil || !strings.Contains(message, "Приключение начинается") || !strings.Contains(message, "Что вы делаете?") {
 		t.Fatal(message, err)
 	}
 	message, err = s.TextMessage(ctx, textOwner, "Я вхожу в таверну")

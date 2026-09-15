@@ -26,6 +26,7 @@ type Command struct {
 		Notation string `json:"notation,omitempty"`
 		ItemID   string `json:"itemId,omitempty"`
 		Ready    bool   `json:"ready,omitempty"`
+		Turn     int    `json:"turn,omitempty"`
 	} `json:"data"`
 }
 type client struct {
@@ -39,11 +40,13 @@ type job struct {
 	client  *client
 }
 type runtime struct {
-	clients map[*client]bool
-	jobs    chan job
-	last    time.Time
- ctx context.Context
- cancel context.CancelFunc
+	activity   Activity
+	activityID uint64
+	clients    map[*client]bool
+	jobs       chan job
+	last       time.Time
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 type Hub struct {
 	mu     sync.Mutex
@@ -74,7 +77,7 @@ func (h *Hub) cleanup() {
 		case <-tick.C:
 			h.mu.Lock()
 			for id, r := range h.rooms {
-				if len(r.clients) == 0 && len(r.jobs) == 0 && time.Since(r.last) > 10*time.Minute {
+				if !r.activity.Processing && len(r.clients) == 0 && len(r.jobs) == 0 && time.Since(r.last) > 10*time.Minute {
 					r.cancel()
 					delete(h.rooms, id)
 				}
@@ -86,15 +89,19 @@ func (h *Hub) cleanup() {
 func (h *Hub) add(id string, c *client) *runtime {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	r := h.runtimeLocked(id)
+	r.clients[c] = true
+	r.last = time.Now()
+	return r
+}
+func (h *Hub) runtimeLocked(id string) *runtime {
 	r := h.rooms[id]
 	if r == nil {
-		roomCtx,cancel:=context.WithCancel(h.ctx)
- r = &runtime{clients: map[*client]bool{}, jobs: make(chan job, 16),ctx:roomCtx,cancel:cancel}
+		roomCtx, cancel := context.WithCancel(h.ctx)
+		r = &runtime{clients: map[*client]bool{}, jobs: make(chan job, 16), ctx: roomCtx, cancel: cancel}
 		h.rooms[id] = r
 		go h.run(id, r)
 	}
-	r.clients[c] = true
-	r.last = time.Now()
 	return r
 }
 func (h *Hub) remove(id string, c *client) {
@@ -118,7 +125,6 @@ func (h *Hub) run(id string, r *runtime) {
 			r.last = time.Now()
 			h.mu.Unlock()
 			ctx, cancel := context.WithTimeout(r.ctx, 150*time.Second)
-			h.broadcast(id, Frame{"game_status_changed", map[string]bool{"processing": true}})
 			e := h.server.command(ctx, id, j.user, j.command)
 			cancel()
 			if e != nil {
@@ -130,7 +136,6 @@ func (h *Hub) run(id string, r *runtime) {
 				h.send(j.client, Frame{"error", map[string]string{"message": message}})
 			}
 			h.Publish(id, "room_state")
-			h.broadcast(id, Frame{"game_status_changed", map[string]bool{"processing": false}})
 			h.mu.Lock()
 			r.last = time.Now()
 			h.mu.Unlock()
@@ -204,7 +209,10 @@ func (s *Server) socket(w http.ResponseWriter, r *http.Request) {
 				if e != nil {
 					return
 				}
- if f.Type=="room_deleted"||f.Type=="room_left" {conn.Close(websocket.StatusNormalClosure,f.Type);return}
+				if f.Type == "room_deleted" || f.Type == "room_left" {
+					conn.Close(websocket.StatusNormalClosure, f.Type)
+					return
+				}
 			case <-tick.C:
 				pingCtx, stop := context.WithTimeout(ctx, 10*time.Second)
 				e := conn.Ping(pingCtx)
@@ -216,9 +224,11 @@ func (s *Server) socket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	// Deletion or departure may race the first membership check and registration.
- if _,err:=s.load(ctx,rid,u.ID);err!=nil {s.Hub.send(c,Frame{"room_left",map[string]string{"message":"Комната недоступна"}})}else{
- s.Hub.send(c, Frame{"room_state", map[string]bool{"refresh": true}})
- }
+	if _, err := s.load(ctx, rid, u.ID); err != nil {
+		s.Hub.send(c, Frame{"room_left", map[string]string{"message": "Комната недоступна"}})
+	} else {
+		s.Hub.sendInitialState(rid, c)
+	}
 	last := time.Time{}
 	for {
 		var cmd Command
@@ -235,15 +245,15 @@ func (s *Server) socket(w http.ResponseWriter, r *http.Request) {
 		}
 		last = time.Now()
 		switch cmd.Type {
-		case "player_action", "roll_dice", "use_item", "ready", "start_game":
+		case "player_action", "roll_dice", "use_item", "ready", "start_game", "pass_turn", "skip_turn":
 		default:
 			s.Hub.send(c, Frame{"error", map[string]string{"message": "Неизвестное событие"}})
 			continue
 		}
 		select {
 		case <-runtime.ctx.Done():
- return
- case runtime.jobs <- job{u.ID, cmd, c}:
+			return
+		case runtime.jobs <- job{u.ID, cmd, c}:
 		default:
 			s.Hub.send(c, Frame{"error", map[string]string{"message": "Очередь комнаты заполнена"}})
 		}
@@ -252,14 +262,26 @@ func (s *Server) socket(w http.ResponseWriter, r *http.Request) {
 
 // Cancel the runtime without closing jobs: a concurrent socket may still submit.
 // Readers receive the terminal event before the writer closes their connection.
-func(h *Hub)DeleteRoom(id string){
- h.mu.Lock();defer h.mu.Unlock()
- if r:=h.rooms[id];r!=nil {
-  delete(h.rooms,id);r.cancel()
-  for c:=range r.clients {h.send(c,Frame{"room_deleted",map[string]string{"message":"Владелец удалил комнату"}})}
- }
+func (h *Hub) DeleteRoom(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if r := h.rooms[id]; r != nil {
+		delete(h.rooms, id)
+		r.cancel()
+		for c := range r.clients {
+			h.send(c, Frame{"room_deleted", map[string]string{"message": "Владелец удалил комнату"}})
+		}
+	}
 }
-func(h *Hub)LeaveRoom(id string,user int64){
- h.mu.Lock();defer h.mu.Unlock()
- if r:=h.rooms[id];r!=nil {for c:=range r.clients{if c.user==user{delete(r.clients,c);h.send(c,Frame{"room_left",map[string]string{"message":"Ты покинул комнату"}})}}}
+func (h *Hub) LeaveRoom(id string, user int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if r := h.rooms[id]; r != nil {
+		for c := range r.clients {
+			if c.user == user {
+				delete(r.clients, c)
+				h.send(c, Frame{"room_left", map[string]string{"message": "Ты покинул комнату"}})
+			}
+		}
+	}
 }

@@ -4,12 +4,14 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
 type Config struct {
 	DatabaseURL, BotToken, BotUsername, AppName, AppURL, SessionSecret, OllamaURL, Model, Addr string
 	BotEnabled                                                                                 bool
+	ContextWindow                                                                              int
 }
 
 func Env(k, d string) string {
@@ -26,6 +28,10 @@ func LoadConfig() (Config, error) {
 	u, e := url.Parse(c.AppURL)
 	if e != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return c, errors.New("некорректный APP_BASE_URL")
+	}
+	c.ContextWindow, e = strconv.Atoi(Env("OLLAMA_CONTEXT_LENGTH", "16384"))
+	if e != nil || c.ContextWindow < 8192 || c.ContextWindow > 32768 {
+		return c, errors.New("OLLAMA_CONTEXT_LENGTH: число от 8192 до 32768")
 	}
 	return c, nil
 }

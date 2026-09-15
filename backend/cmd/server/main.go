@@ -4,6 +4,7 @@ import (
 	"context"
 	"dnd-bot/backend/internal/ai"
 	"dnd-bot/backend/internal/bot"
+	"dnd-bot/backend/internal/notifications"
 	"dnd-bot/backend/internal/server"
 	"dnd-bot/backend/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,11 +41,14 @@ func run() error {
 	if e != nil {
 		return e
 	}
-	s := &server.Server{Config: cfg, Pool: pool, AI: ai.New(cfg.OllamaURL)}
+	provider := ai.New(cfg.OllamaURL)
+	provider.ContextWindow = cfg.ContextWindow
+	s := &server.Server{Config: cfg, Pool: pool, AI: provider}
 	s.Hub = server.NewHub(ctx, s)
 	if cfg.BotEnabled {
 		b := &bot.Bot{Token: cfg.BotToken, AppURL: cfg.AppURL, Handle: s.TextMessage}
 		go b.Run(ctx)
+		go notifications.Run(ctx, pool, b.Send)
 	}
 	srv := &http.Server{Addr: cfg.Addr, Handler: s.Router(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	errs := make(chan error, 1)

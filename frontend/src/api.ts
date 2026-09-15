@@ -3,6 +3,15 @@ export const setToken = (value: string) => {
   token = value;
 };
 export const getToken = () => token;
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public code: string,
+  ) {
+    super(message);
+  }
+}
 export async function api<T>(
   path: string,
   method = "GET",
@@ -16,8 +25,13 @@ export async function api<T>(
     },
     body: data === undefined ? undefined : JSON.stringify(data),
   });
-  const body = await response.json();
+  const body = await response.json().catch(() => null);
   if (!response.ok)
-    throw new Error(body.error?.message || "Не удалось связаться с сервером");
+    throw new ApiError(
+      body?.error?.message || "Сервер временно недоступен. Попробуй ещё раз.",
+      response.status,
+      body?.error?.code || "HTTP_ERROR",
+    );
+  if (body === null) throw new Error("Сервер вернул некорректный ответ");
   return body as T;
 }

@@ -5,13 +5,16 @@ import (
 	"dnd-bot/backend/internal/game"
 	"dnd-bot/backend/internal/store"
 	"encoding/json"
+	"errors"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -22,6 +25,7 @@ type Member struct {
 	Ready  bool   `json:"ready"`
 }
 type Room struct {
+	Activity  Activity   `json:"activity"`
 	ID        string     `json:"id"`
 	Code      string     `json:"code"`
 	OwnerID   int64      `json:"ownerId"`
@@ -48,9 +52,13 @@ func isMember(m []Member, user int64) bool {
 }
 func (s *Server) room(ctx context.Context, q *store.Queries, raw store.Room) (Room, error) {
 	out := Room{ID: key(raw.ID), Code: raw.Code, OwnerID: raw.OwnerID, Status: raw.Status, Members: []Member{}}
+	if s.Hub != nil {
+		out.Activity = s.Hub.Activity(out.ID)
+	}
 	if e := json.Unmarshal(raw.State, &out.State); e != nil {
 		return out, e
 	}
+	out.State.EnsureCombatOrder(0, raw.UpdatedAt.Time)
 	ms, e := q.ListMembers(ctx, raw.ID)
 	if e != nil {
 		return out, e
@@ -99,8 +107,12 @@ func (s *Server) mutate(ctx context.Context, roomID string, user int64, allowJoi
 	}
 	defer tx.Rollback(context.Background())
 	q := store.New(tx)
-	raw, e := q.LockRoom(ctx, u)
+	raw, e := q.LockRoomNowait(ctx, u)
 	if e != nil {
+		var pgerr *pgconn.PgError
+		if errors.As(e, &pgerr) && pgerr.Code == "55P03" {
+			return Room{}, &apiError{409, "ROOM_BUSY", "В этой комнате уже выполняется действие. Дождись ответа мастера."}
+		}
 		return Room{}, e
 	}
 	room, e := s.room(ctx, q, raw)
@@ -110,14 +122,72 @@ func (s *Server) mutate(ctx context.Context, roomID string, user int64, allowJoi
 	if !allowJoin && !isMember(room.Members, user) {
 		return room, denied()
 	}
+	if kind, _ := ctx.Value(operationKey{}).(string); kind != "" && s.Hub != nil {
+		name := "Игрок"
+		for _, m := range room.Members {
+			if m.UserID == user {
+				name = m.Name
+			}
+		}
+		if hero := room.State.Hero(user); hero != nil {
+			name = hero.Name
+		}
+		end := s.Hub.beginActivity(roomID, user, name, kind)
+		defer func() { _ = tx.Rollback(context.Background()); end() }()
+	}
+	before, e := q.ListEvents(ctx, u)
+	if e != nil {
+		return room, e
+	}
+	previousTurn := room.State.Turn
 	if e = fn(q, &room); e != nil {
 		return room, e
+	}
+	// The next player gets a full minute after narration finishes, not while
+	// the model is still describing the preceding player's action.
+	if room.State.Combat && room.State.Turn != previousTurn {
+		room.State.CombatTurnSince = time.Now()
 	}
 	if e = s.persist(ctx, q, room); e != nil {
 		return room, e
 	}
+	after, e := q.ListEvents(ctx, u)
+	if e != nil {
+		return room, e
+	}
+	known := make(map[string]bool, len(before))
+	for _, v := range before {
+		known[key(v.ID)] = true
+	}
+	fresh := []Event{}
+	for _, v := range after {
+		if !known[key(v.ID)] {
+			fresh = append(fresh, Event{ID: key(v.ID), Type: v.Type, Payload: v.Payload})
+		}
+	}
+	receipt, _ := ctx.Value(receiptKey{}).(*commandReceipt)
+	exclude := int64(0)
+	if receipt != nil {
+		exclude = receipt.Author
+	}
+	if len(fresh) > 0 {
+		message := room.State.Settings.Name + " · " + room.Code + "\n\n" + renderTextEvents(fresh)
+		if hero := room.State.CombatHero(); hero != nil {
+			message += "\n\nСейчас ходит: " + hero.Name
+		}
+		_, e = tx.Exec(ctx, `INSERT INTO telegram_outbox(room_id,user_id,body)
+ SELECT s.room_id,s.user_id,$3 FROM bot_sessions s
+ JOIN room_members m ON m.room_id=s.room_id AND m.user_id=s.user_id
+ WHERE s.room_id=$1 AND s.user_id<>$2 AND s.notifications`, u, exclude, message)
+		if e != nil {
+			return room, e
+		}
+	}
 	if e = tx.Commit(ctx); e != nil {
 		return room, e
+	}
+	if receipt != nil {
+		receipt.Events = fresh
 	}
 	return room, nil
 }
@@ -319,8 +389,8 @@ func (s *Server) leaveRoom(w http.ResponseWriter, r *http.Request) {
 		fail(w, e)
 		return
 	}
-	s.Hub.LeaveRoom(rid,uid(r))
- s.Hub.Publish(rid, "player_left")
+	s.Hub.LeaveRoom(rid, uid(r))
+	s.Hub.Publish(rid, "player_left")
 	respond(w, 200, map[string]bool{"ok": true})
 }
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
@@ -421,6 +491,9 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	s.finish(w, r, rid, e, "game_status_changed")
 }
 func (s *Server) startGame(ctx context.Context, rid string, user int64) error {
+	ctx = context.WithValue(ctx, operationKey{}, "start_game")
+	ctx, cancel := context.WithTimeout(ctx, 150*time.Second)
+	defer cancel()
 	_, e := s.mutate(ctx, rid, user, false, func(q *store.Queries, room *Room) error {
 		if !CanManage(room.OwnerID, user) {
 			return denied()
@@ -428,12 +501,24 @@ func (s *Server) startGame(ctx context.Context, rid string, user int64) error {
 		if room.Status != "WAITING" && room.Status != "PAUSED" {
 			return bad("Игра уже запущена")
 		}
-		if len(room.State.Characters) == 0 {
-			return bad("Создай хотя бы одного персонажа")
+		if len(room.State.Characters) == 0 || room.State.PartyDefeated() {
+			return bad("Для старта нужен хотя бы один живой персонаж")
+		}
+		if room.Status == "WAITING" {
+			if err := lobbyReady(room); err != nil {
+				return err
+			}
+			return s.openAdventure(ctx, q, room, user)
 		}
 		room.Status = "PLAYING"
-		return s.addEvent(ctx, q, rid, user, "GAME_STARTED", game.Result{Type: "GAME_STARTED", Text: "Кампания началась. Напиши первое действие, чтобы ведущий создал сцену."})
+		if room.State.Combat {
+			room.State.CombatTurnSince = time.Now()
+		}
+		return s.addEvent(ctx, q, rid, user, "GAME_RESUMED", game.Result{Type: "GAME_RESUMED", Text: "Кампания продолжается."})
 	})
+	if e == nil && s.Hub != nil {
+		s.Hub.Publish(rid, "game_status_changed")
+	}
 	return e
 }
 func (s *Server) pause(w http.ResponseWriter, r *http.Request) {
@@ -446,7 +531,7 @@ func (s *Server) pause(w http.ResponseWriter, r *http.Request) {
 			return bad("Игра не запущена")
 		}
 		room.Status = "PAUSED"
-		return nil
+		return s.addEvent(r.Context(), q, rid, uid(r), "GAME_PAUSED", game.Result{Type: "GAME_PAUSED", Text: "Владелец поставил кампанию на паузу."})
 	})
 	s.finish(w, r, rid, e, "game_status_changed")
 }

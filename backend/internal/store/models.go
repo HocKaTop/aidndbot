@@ -9,8 +9,9 @@ import (
 )
 
 type BotSession struct {
-	UserID int64       `json:"user_id"`
-	RoomID pgtype.UUID `json:"room_id"`
+	UserID        int64       `json:"user_id"`
+	RoomID        pgtype.UUID `json:"room_id"`
+	Notifications bool        `json:"notifications"`
 }
 
 type CampaignSummary struct {
@@ -78,6 +79,15 @@ type Scene struct {
 	ID     pgtype.UUID `json:"id"`
 	RoomID pgtype.UUID `json:"room_id"`
 	Data   []byte      `json:"data"`
+}
+
+type TelegramOutbox struct {
+	ID          int64              `json:"id"`
+	RoomID      pgtype.UUID        `json:"room_id"`
+	UserID      int64              `json:"user_id"`
+	Body        string             `json:"body"`
+	Attempts    int32              `json:"attempts"`
+	NextAttempt pgtype.Timestamptz `json:"next_attempt"`
 }
 
 type User struct {

@@ -4,16 +4,19 @@ export function useRoomSocket(
   roomId: string | undefined,
   refresh: () => void,
   onError: (message: string) => void,
+  onRemoved: (message: string) => void,
 ) {
   const socket = useRef<WebSocket | null>(null);
-  const callbacks = useRef({ refresh, onError });
-  callbacks.current = { refresh, onError };
+  const callbacks = useRef({ refresh, onError, onRemoved });
+  callbacks.current = { refresh, onError, onRemoved };
   const [status, setStatus] = useState("offline");
   const [processing, setProcessing] = useState(false);
+  const [actor, setActor] = useState("");
   useEffect(() => {
     if (!roomId) {
       setStatus("offline");
       setProcessing(false);
+      setActor("");
       return;
     }
     let closed = false,
@@ -31,15 +34,26 @@ export function useRoomSocket(
       };
       ws.onmessage = (event) => {
         try {
+          if (closed) return;
           const frame = JSON.parse(event.data);
-          if (frame.type === "error") {
+          if (frame.type === "room_deleted" || frame.type === "room_left") {
+            closed = true;
+            setStatus("offline");
             setProcessing(false);
+            setActor("");
+            ws.close();
+            callbacks.current.onRemoved(
+              frame.data?.message || "Комната недоступна",
+            );
+            return;
+          }
+          if (frame.type === "error") {
             callbacks.current.onError(frame.data.message);
             return;
           }
           if (frame.data?.processing !== undefined) {
             setProcessing(frame.data.processing);
-            return;
+            setActor(frame.data.processing ? frame.data.name || "" : "");
           }
           if (frame.data?.refresh) {
             attempt = 0;
@@ -54,7 +68,14 @@ export function useRoomSocket(
         if (closed) return;
         setStatus("offline");
         setProcessing(false);
+        setActor("");
+        if (event.reason === "room_deleted" || event.reason === "room_left") {
+          closed = true;
+          callbacks.current.onRemoved("Комната удалена или больше недоступна");
+          return;
+        }
         if (event.code === 1008) {
+          callbacks.current.refresh();
           callbacks.current.onError(
             "Нет доступа или сессия истекла. Открой приложение заново через Telegram.",
           );
@@ -86,5 +107,5 @@ export function useRoomSocket(
     },
     [status],
   );
-  return { status, processing, send };
+  return { status, processing, actor, send };
 }

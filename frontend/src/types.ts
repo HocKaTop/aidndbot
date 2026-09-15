@@ -57,6 +57,10 @@ export type Room = {
     }[];
     scene: { title: string; description: string; location: string } | null;
     combat: boolean;
+    combatOrder?: number[];
+    combatIndex?: number;
+    combatRound?: number;
+    combatTurnSince?: string;
     turn: number;
   };
 };
