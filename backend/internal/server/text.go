@@ -29,6 +29,7 @@ const textHelp = `Можно играть прямо здесь, без Mini App
 /roll d20 — бросить кубик
 /use 1 — использовать предмет по номеру из /state
 /pause — поставить игру на паузу
+/finish — завершить кампанию и сохранить итоги (владелец, с подтверждением)
 /delete — удалить выбранную комнату (владелец, с подтверждением)
 /rooms — мои кампании
 /room КОД — переключиться на свою кампанию
@@ -141,7 +142,7 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 	}
 	if isCommand {
 		switch command {
-		case "/play", "/pause", "/state", "/history", "/roll", "/use", "/delete", "/ready", "/unready", "/pass", "/skip", "/mute", "/unmute":
+		case "/play", "/pause", "/finish", "/state", "/history", "/roll", "/use", "/delete", "/ready", "/unready", "/pass", "/skip", "/mute", "/unmute":
 		default:
 			return "Неизвестная команда. /help — список команд.", nil
 		}
@@ -156,6 +157,30 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		return "", err
 	}
 	switch command {
+	case "/finish":
+		if !CanManage(room.OwnerID, user.ID) {
+			return "", denied()
+		}
+		if room.Status == "FINISHED" {
+			return describeEnding(room), nil
+		}
+		if room.Status == "WAITING" {
+			return "Приключение ещё не началось. /play — начать, /delete — удалить комнату.", nil
+		}
+		if arg == "" {
+			return fmt.Sprintf("Завершить «%s» для всего отряда? Продолжить эту кампанию будет нельзя; герои и история сохранятся. Для перерыва используй /pause.\nДля завершения отправь:\n/finish %s", room.State.Settings.Name, room.Code), nil
+		}
+		cmd := Command{Type: "finish_game", ExpectedTurn: &room.State.Turn}
+		cmd.Data.Code = arg
+		if err = s.command(ctx, rid, user.ID, cmd); err != nil {
+			return "", err
+		}
+		s.Hub.Publish(rid, "game_status_changed")
+		room, err = s.load(ctx, rid, user.ID)
+		if err != nil {
+			return "", err
+		}
+		return describeEnding(room), nil
 	case "/mute", "/unmute":
 		_, err = s.Pool.Exec(ctx, "UPDATE bot_sessions SET notifications=$2 WHERE user_id=$1", user.ID, command == "/unmute")
 		if err != nil {
@@ -218,6 +243,9 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		s.Hub.Publish(rid, "game_status_changed")
 		return "Игра на паузе. /play — продолжить.", nil
 	}
+	if room.Status == "FINISHED" {
+		return describeEnding(room), nil
+	}
 	if room.Status != "PLAYING" {
 		return "Сначала владелец должен написать /play. /state — состояние кампании.", nil
 	}
@@ -266,6 +294,9 @@ func describeRoom(r Room, user int64) string {
 	var out strings.Builder
 	labels := map[string]string{"WAITING": "сбор отряда", "PLAYING": "игра идёт", "PAUSED": "пауза", "FINISHED": "завершена"}
 	fmt.Fprintf(&out, "%s · %s\nКод: %s\n", r.State.Settings.Name, labels[r.Status], r.Code)
+	if r.Status == "FINISHED" {
+		fmt.Fprintf(&out, "\n%s\n", describeEnding(r))
+	}
 	if r.Activity.Processing {
 		fmt.Fprintf(&out, "\nМастер обрабатывает действие: %s.\n", r.Activity.Name)
 	}

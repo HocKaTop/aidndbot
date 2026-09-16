@@ -19,14 +19,17 @@ type Frame struct {
 	Data any    `json:"data"`
 }
 type Command struct {
-	Type string `json:"type"`
-	Data struct {
+	ID           string `json:"id,omitempty"`
+	ExpectedTurn *int   `json:"expectedTurn,omitempty"`
+	Type         string `json:"type"`
+	Data         struct {
 		Token    string `json:"token,omitempty"`
 		Text     string `json:"text,omitempty"`
 		Notation string `json:"notation,omitempty"`
 		ItemID   string `json:"itemId,omitempty"`
 		Ready    bool   `json:"ready,omitempty"`
 		Turn     int    `json:"turn,omitempty"`
+		Code     string `json:"code,omitempty"`
 	} `json:"data"`
 }
 type client struct {
@@ -40,6 +43,7 @@ type job struct {
 	client  *client
 }
 type runtime struct {
+	pending    map[pendingKey]*pendingCommand
 	activity   Activity
 	activityID uint64
 	clients    map[*client]bool
@@ -98,7 +102,7 @@ func (h *Hub) runtimeLocked(id string) *runtime {
 	r := h.rooms[id]
 	if r == nil {
 		roomCtx, cancel := context.WithCancel(h.ctx)
-		r = &runtime{clients: map[*client]bool{}, jobs: make(chan job, 16), ctx: roomCtx, cancel: cancel}
+		r = &runtime{clients: map[*client]bool{}, pending: map[pendingKey]*pendingCommand{}, jobs: make(chan job, 16), ctx: roomCtx, cancel: cancel}
 		h.rooms[id] = r
 		go h.run(id, r)
 	}
@@ -125,18 +129,27 @@ func (h *Hub) run(id string, r *runtime) {
 			r.last = time.Now()
 			h.mu.Unlock()
 			ctx, cancel := context.WithTimeout(r.ctx, 150*time.Second)
+			h.commandProgress(r, j.user, j.command, "processing", "")
 			e := h.server.command(ctx, id, j.user, j.command)
 			cancel()
+			status, message := "completed", ""
 			if e != nil {
-				message := "Не удалось выполнить действие. Попробуй ещё раз."
+				status, message = "unknown", "Не удалось подтвердить результат. Проверь его или повтори отправку."
 				var a *apiError
 				if errors.As(e, &a) {
 					message = a.Message
+					if a.Code != "ROOM_BUSY" {
+						status = "failed"
+					}
 				}
-				h.send(j.client, Frame{"error", map[string]string{"message": message}})
+				if j.command.ID == "" {
+					h.replyCommand(j.client, j.command, status, message)
+				}
 			}
+			h.commandProgress(r, j.user, j.command, status, message)
 			h.Publish(id, "room_state")
 			h.mu.Lock()
+			delete(r.pending, pendingKey{j.user, j.command.ID})
 			r.last = time.Now()
 			h.mu.Unlock()
 		}
@@ -239,24 +252,22 @@ func (s *Server) socket(w http.ResponseWriter, r *http.Request) {
 			conn.Close(websocket.StatusPolicyViolation, "session expired")
 			return
 		}
+		if cmd.Type == "command_status" {
+			s.Hub.send(c, Frame{"command_status", s.queryCommand(ctx, rid, u.ID, cmd.ID)})
+			continue
+		}
 		if time.Since(last) < time.Second {
-			s.Hub.send(c, Frame{"error", map[string]string{"message": "Подожди секунду перед следующим действием"}})
+			s.Hub.replyCommand(c, cmd, "unknown", "Подожди секунду перед повторной отправкой.")
 			continue
 		}
 		last = time.Now()
 		switch cmd.Type {
-		case "player_action", "roll_dice", "use_item", "ready", "start_game", "pass_turn", "skip_turn":
+		case "player_action", "roll_dice", "use_item", "ready", "start_game", "pass_turn", "skip_turn", "finish_game":
 		default:
-			s.Hub.send(c, Frame{"error", map[string]string{"message": "Неизвестное событие"}})
+			s.Hub.replyCommand(c, cmd, "failed", "Неизвестное событие")
 			continue
 		}
-		select {
-		case <-runtime.ctx.Done():
-			return
-		case runtime.jobs <- job{u.ID, cmd, c}:
-		default:
-			s.Hub.send(c, Frame{"error", map[string]string{"message": "Очередь комнаты заполнена"}})
-		}
+		s.Hub.submit(runtime, c, cmd)
 	}
 }
 

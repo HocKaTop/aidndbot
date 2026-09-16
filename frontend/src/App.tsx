@@ -29,6 +29,7 @@ import {
 import { api, setToken, ApiError } from "./api";
 import { useRoomSocket } from "./useRoomSocket";
 import { DeleteRoomDialog } from "./DeleteRoomDialog";
+import { CampaignEnding, FinishCampaignDialog } from "./CampaignEnding";
 import { SettingsForm, HeroCard } from "./components";
 import type { GameEvent, Room, Settings, User } from "./types";
 const defaults: Settings = {
@@ -73,10 +74,10 @@ export default function App() {
     [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(true),
     [code, setCode] = useState(WebApp.initDataUnsafe.start_param || ""),
-    [text, setText] = useState(""),
     [dice, setDice] = useState("d20"),
     [notice, setNotice] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<Room | null>(null);
+  const [finishTarget, setFinishTarget] = useState<string | null>(null);
   const active = useRef<string | null>(null);
   const refreshSequence = useRef(0);
   const bottom = useRef<HTMLDivElement>(null);
@@ -137,6 +138,7 @@ export default function App() {
     setRoom(null);
     setEvents([]);
     setDeleteTarget(null);
+    setFinishTarget(null);
     setScreen("home");
     setError("");
     setNotice(message);
@@ -166,11 +168,23 @@ export default function App() {
         else setError(e.message);
       });
   }, [removed]);
-  const { status, processing, actor, send } = useRoomSocket(
+  const {
+    status,
+    processing,
+    actor,
+    send,
+    draft: text,
+    setDraft: setText,
+    delivery,
+    pending,
+    retry,
+  } = useRoomSocket(
     room?.id,
     refresh,
     setError,
     removed,
+    user?.id,
+    room?.state.turn,
   );
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -181,14 +195,13 @@ export default function App() {
     setScreen("room");
     setTab(r.status === "WAITING" ? "party" : "game");
     setEvents([]);
-    setText("");
     refresh();
   };
   const home = () => {
     active.current = null;
     setRoom(null);
     setDeleteTarget(null);
-    setText("");
+    setFinishTarget(null);
     setScreen("home");
     void run(async () => setRooms(await api<Room[]>("/rooms")));
   };
@@ -238,10 +251,8 @@ export default function App() {
   };
   const action = (e: FormEvent) => {
     e.preventDefault();
-    if (!myTurn || processing || room?.status !== "PLAYING") return;
-    if (text.trim() && send("player_action", { text })) {
-      setText("");
-    }
+    if (!myTurn || processing || pending || room?.status !== "PLAYING") return;
+    if (text.trim()) send("player_action", { text });
   };
   if (loading)
     return (
@@ -488,6 +499,15 @@ export default function App() {
               {labels[room.status]}
               {room.state.combat && <span className="combat-label">Бой</span>}
             </div>
+            {owner && ["PLAYING", "PAUSED"].includes(room.status) && (
+              <button
+                className="secondary"
+                disabled={busy || processing || pending || status !== "online"}
+                onClick={() => setFinishTarget(room.id)}
+              >
+                Завершить приключение
+              </button>
+            )}
             {waiting && (
               <section className="panel stack" aria-label="Подготовка отряда">
                 <h2>
@@ -530,6 +550,40 @@ export default function App() {
                 Мастер обрабатывает действие: {actor}
               </p>
             )}
+            {delivery && (
+              <section className="panel stack" aria-label="Статус действия">
+                <p role="status">
+                  {
+                    {
+                      sent: "Отправлено — ждём подтверждения",
+                      queued: "Принято сервером — ждём выполнения",
+                      processing: "Действие выполняется",
+                      unknown: "Результат пока не подтверждён",
+                      failed: "Действие не выполнено",
+                      completed: "Действие выполнено",
+                    }[delivery.status]
+                  }
+                </p>
+                {delivery.message && <p>{delivery.message}</p>}
+                {delivery.status === "unknown" && (
+                  <p>
+                    Текст сохранён. После подключения проверим результат.
+                    Повторная отправка этого действия не создаст второй ход.
+                  </p>
+                )}
+                {["failed", "unknown"].includes(delivery.status) &&
+                  (delivery.packet.type !== "player_action" ||
+                    delivery.packet.data.text === text) && (
+                    <button
+                      className="secondary"
+                      disabled={status !== "online" || processing}
+                      onClick={retry}
+                    >
+                      Повторить отправку
+                    </button>
+                  )}
+              </section>
+            )}
             {combatHero && (
               <section className="panel stack" aria-label="Очередь боя">
                 <h2>
@@ -556,6 +610,7 @@ export default function App() {
                     className="secondary"
                     disabled={
                       processing ||
+                      pending ||
                       status !== "online" ||
                       room.status !== "PLAYING"
                     }
@@ -569,6 +624,7 @@ export default function App() {
                     className="secondary"
                     disabled={
                       processing ||
+                      pending ||
                       status !== "online" ||
                       room.status !== "PLAYING" ||
                       skipWait !== 0
@@ -699,7 +755,7 @@ export default function App() {
                 {waiting && hero && (
                   <button
                     className="secondary full"
-                    disabled={processing || status !== "online"}
+                    disabled={processing || pending || status !== "online"}
                     onClick={() =>
                       send("ready", {
                         ready: !room.members.find((m) => m.userId === user.id)
@@ -719,6 +775,7 @@ export default function App() {
                     disabled={
                       busy ||
                       processing ||
+                      pending ||
                       status !== "online" ||
                       !room.state.characters.length ||
                       (waiting && pendingMembers.length > 0)
@@ -765,13 +822,7 @@ export default function App() {
               </>
             )}
             {room.status === "FINISHED" && (
-              <section className="panel">
-                <h2>Кампания завершена</h2>
-                <p>
-                  Весь отряд пал. История сохранена; можно перечитать журнал или
-                  начать новую кампанию.
-                </p>
-              </section>
+              <CampaignEnding room={room} onHome={home} />
             )}
             {hero && hero.hp <= 0 && room.status !== "FINISHED" && (
               <p className="error">
@@ -854,85 +905,90 @@ export default function App() {
                   )}
                   <div ref={bottom} />
                 </div>
-                <form className="composer" onSubmit={action}>
-                  {room.status === "PLAYING" &&
-                    room.state.turn === 0 &&
-                    hero &&
-                    hero.hp > 0 && (
-                      <div className="action-examples">
-                        <p>
-                          Что попробовать? Выбери пример и дополни его или
-                          напиши своё действие.
-                        </p>
-                        {actionExamples.map((example) => (
-                          <button
-                            type="button"
-                            className="secondary"
-                            key={example}
-                            disabled={processing}
-                            onClick={() => setText(example)}
-                          >
-                            {example}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  <textarea
-                    aria-label="Действие персонажа"
-                    placeholder="Что ты делаешь?"
-                    maxLength={1000}
-                    value={text}
-                    onChange={(e) => setText(e.target.value)}
-                    disabled={
-                      waiting ||
-                      room.status !== "PLAYING" ||
-                      !myTurn ||
-                      !hero ||
-                      hero.hp <= 0
-                    }
-                  />
-                  <div className="inline">
-                    <select
-                      aria-label="Кубик"
-                      value={dice}
-                      onChange={(e) => setDice(e.target.value)}
-                    >
-                      <option>d20</option>
-                      <option>d6</option>
-                      <option>2d6+3</option>
-                      <option>1d8-1</option>
-                    </select>
-                    <button
-                      type="button"
-                      aria-label="Бросить кубик"
+                {room.status !== "FINISHED" && (
+                  <form className="composer" onSubmit={action}>
+                    {room.status === "PLAYING" &&
+                      room.state.turn === 0 &&
+                      hero &&
+                      hero.hp > 0 && (
+                        <div className="action-examples">
+                          <p>
+                            Что попробовать? Выбери пример и дополни его или
+                            напиши своё действие.
+                          </p>
+                          {actionExamples.map((example) => (
+                            <button
+                              type="button"
+                              className="secondary"
+                              key={example}
+                              disabled={processing || pending}
+                              onClick={() => setText(example)}
+                            >
+                              {example}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    <textarea
+                      aria-label="Действие персонажа"
+                      placeholder="Что ты делаешь?"
+                      maxLength={1000}
+                      value={text}
+                      onChange={(e) => setText(e.target.value)}
                       disabled={
-                        processing ||
-                        status !== "online" ||
+                        pending ||
+                        waiting ||
                         room.status !== "PLAYING" ||
+                        !myTurn ||
                         !hero ||
                         hero.hp <= 0
                       }
-                      onClick={() => send("roll_dice", { notation: dice })}
-                    >
-                      <Dices size={20} />
-                    </button>
-                    <button
-                      className="primary"
-                      aria-label="Отправить действие"
-                      disabled={
-                        processing ||
-                        !myTurn ||
-                        status !== "online" ||
-                        room.status !== "PLAYING" ||
-                        !hero ||
-                        hero.hp <= 0 ||
-                        !text.trim()
-                      }
-                    >
-                      <Send size={18} />
-                    </button>
-                  </div>
-                </form>
+                    />
+                    <div className="inline">
+                      <select
+                        aria-label="Кубик"
+                        value={dice}
+                        onChange={(e) => setDice(e.target.value)}
+                      >
+                        <option>d20</option>
+                        <option>d6</option>
+                        <option>2d6+3</option>
+                        <option>1d8-1</option>
+                      </select>
+                      <button
+                        type="button"
+                        aria-label="Бросить кубик"
+                        disabled={
+                          processing ||
+                          pending ||
+                          status !== "online" ||
+                          room.status !== "PLAYING" ||
+                          !hero ||
+                          hero.hp <= 0
+                        }
+                        onClick={() => send("roll_dice", { notation: dice })}
+                      >
+                        <Dices size={20} />
+                      </button>
+                      <button
+                        className="primary"
+                        aria-label="Отправить действие"
+                        disabled={
+                          processing ||
+                          pending ||
+                          !myTurn ||
+                          status !== "online" ||
+                          room.status !== "PLAYING" ||
+                          !hero ||
+                          hero.hp <= 0 ||
+                          !text.trim()
+                        }
+                      >
+                        <Send size={18} />
+                      </button>
+                    </div>
+                  </form>
+                )}
               </>
             )}
             {tab === "hero" &&
@@ -954,6 +1010,7 @@ export default function App() {
                           <button
                             disabled={
                               processing ||
+                              pending ||
                               !myTurn ||
                               status !== "online" ||
                               room.status !== "PLAYING" ||
@@ -1055,6 +1112,18 @@ export default function App() {
           ))}
         </nav>
       )}
+      {room &&
+        screen === "room" &&
+        finishTarget === room.id &&
+        ["PLAYING", "PAUSED"].includes(room.status) && (
+          <FinishCampaignDialog
+            room={room}
+            key={room.id}
+            disabled={busy || processing || pending || status !== "online"}
+            onCancel={() => setFinishTarget(null)}
+            onConfirm={(code, text) => send("finish_game", { code, text })}
+          />
+        )}
       {deleteTarget && (
         <DeleteRoomDialog
           room={deleteTarget}

@@ -28,6 +28,15 @@ type Character struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type CommandReceipt struct {
+	RoomID      pgtype.UUID        `json:"room_id"`
+	UserID      int64              `json:"user_id"`
+	CommandID   pgtype.UUID        `json:"command_id"`
+	RequestHash string             `json:"request_hash"`
+	Events      []byte             `json:"events"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+}
+
 type GameEvent struct {
 	ID        pgtype.UUID        `json:"id"`
 	RoomID    pgtype.UUID        `json:"room_id"`

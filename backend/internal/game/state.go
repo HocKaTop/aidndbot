@@ -70,6 +70,7 @@ type Scene struct {
 	Location    string `json:"location"`
 }
 type State struct {
+	Ending          *Ending     `json:"ending,omitempty"`
 	Settings        Settings    `json:"settings"`
 	Characters      []Character `json:"characters"`
 	NPCs            []NPC       `json:"npcs"`
@@ -84,12 +85,22 @@ type State struct {
 	Turn            int         `json:"turn"`
 }
 
+type Ending struct {
+	Reason     string    `json:"reason"`
+	Note       string    `json:"note"`
+	FinishedAt time.Time `json:"finishedAt"`
+}
+
 func NewState(s Settings) State {
 	return State{Settings: s, Characters: []Character{}, NPCs: []NPC{}, Quests: []Quest{}}
 }
 
 // Clone isolates speculative validation from the authoritative state.
 func (s State) Clone() State {
+	if s.Ending != nil {
+		ending := *s.Ending
+		s.Ending = &ending
+	}
 	s.CombatOrder = slices.Clone(s.CombatOrder)
 	s.Characters = slices.Clone(s.Characters)
 	for i := range s.Characters {

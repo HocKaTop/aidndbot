@@ -58,6 +58,7 @@ class FakeSocket {
   }
 }
 beforeEach(() => {
+  localStorage.clear();
   FakeSocket.sockets = [];
   vi.stubGlobal("WebSocket", FakeSocket);
 });
@@ -260,14 +261,14 @@ it("restores the processing player on reconnect and clears it when the turn ends
 });
 
 describe("adventure onboarding", () => {
-  function setup(initial: Room) {
+  function setup(initial: Room, userId = 1) {
     let current = initial;
     const fetcher = vi.fn(async (input: string | URL | Request) => {
       const path = String(input);
       const data =
         path === "/api/auth/telegram"
           ? {
-              user: { id: 1, firstName: "Tester", username: "" },
+              user: { id: userId, firstName: "Tester", username: "" },
               token: "test",
             }
           : path === "/api/rooms"
@@ -291,6 +292,130 @@ describe("adventure onboarding", () => {
       },
     };
   }
+
+  it("confirms finishing, sends a tracked command and shows saved results", async () => {
+    const current = structuredClone(room);
+    current.status = "PLAYING";
+    current.state.turn = 9;
+    current.state.quests = [
+      { id: "quest", title: "Спасти мост", description: "", status: "ACTIVE" },
+    ];
+    const mock = setup(current);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Тестовая кампания/ }),
+    );
+    const socket = FakeSocket.sockets.at(-1)!;
+    await act(async () => {
+      socket.emit("room_state", { refresh: true });
+    });
+    await userEvent.click(
+      screen.getByRole("button", { name: "Завершить приключение" }),
+    );
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Завершить и сохранить",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Отмена" }));
+    expect(socket.sent).toHaveLength(0);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Завершить приключение" }),
+    );
+    await userEvent.type(
+      screen.getByLabelText("Код подтверждения завершения"),
+      current.code,
+    );
+    await userEvent.type(
+      screen.getByLabelText("Итог истории (необязательно)"),
+      "Вернулись домой.",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Завершить и сохранить" }),
+    );
+    expect(screen.queryByRole("dialog")).toBe(null);
+    const sent = JSON.parse(socket.sent.at(-1)!);
+    expect(sent).toEqual({
+      id: expect.any(String),
+      type: "finish_game",
+      expectedTurn: 9,
+      data: { code: current.code, text: "Вернулись домой." },
+    });
+    const finished = structuredClone(current);
+    finished.status = "FINISHED";
+    finished.state.ending = {
+      reason: "owner",
+      note: "Вернулись домой.",
+      finishedAt: new Date().toISOString(),
+    };
+    mock.update(finished);
+    await act(async () => {
+      socket.emit("command_status", { id: sent.id, status: "completed" });
+    });
+    expect(
+      await screen.findByRole("heading", { name: "Приключение завершено" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Вернулись домой.")).toBeTruthy();
+    expect(screen.getByText(/незавершено 1/)).toBeTruthy();
+    expect(screen.queryByLabelText("Действие персонажа")).toBe(null);
+    expect(
+      screen.queryByRole("button", { name: "Завершить приключение" }),
+    ).toBe(null);
+    expect(screen.getByText("Фонарь погас. Что вы делаете?")).toBeTruthy();
+    await userEvent.click(
+      screen.getByRole("button", { name: "К списку кампаний" }),
+    );
+    expect(screen.getByText("Твои кампании")).toBeTruthy();
+  });
+
+  it("hides finishing for non-owners", async () => {
+    const current = structuredClone(room);
+    current.status = "PAUSED";
+    setup(current, 2);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Тестовая кампания/ }),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Завершить приключение" }),
+    ).toBe(null);
+  });
+
+  it("opens legacy defeated campaigns as readable results", async () => {
+    const current = structuredClone(room);
+    current.status = "FINISHED";
+    current.state.characters = [
+      {
+        id: "hero",
+        userId: 1,
+        name: "Tester",
+        race: "Человек",
+        class: "Воин",
+        level: 1,
+        hp: 0,
+        maxHp: 20,
+        armorClass: 13,
+        stats: {},
+        inventory: [],
+      },
+    ];
+    setup(current);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Тестовая кампания/ }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Отряд пал" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/Выжило героев: 0\/1/)).toBeTruthy();
+    expect(screen.queryByLabelText("Действие персонажа")).toBe(null);
+    await userEvent.click(screen.getByRole("button", { name: "Отряд" }));
+    expect(screen.queryByRole("button", { name: "Продолжить кампанию" })).toBe(
+      null,
+    );
+  });
 
   it("shows the current fighter and prevents acting out of turn", async () => {
     const current = structuredClone(room);
@@ -338,15 +463,21 @@ describe("adventure onboarding", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Пропустить ход: Анна" }),
     );
-    expect(socket.sent.map((v) => JSON.parse(v))).toContainEqual({
-      type: "skip_turn",
-      data: { turn: 7 },
-    });
+    expect(socket.sent.map((v) => JSON.parse(v))).toContainEqual(
+      expect.objectContaining({
+        type: "skip_turn",
+        data: { turn: 7 },
+      }),
+    );
     const next = structuredClone(current);
     next.state.combatIndex = 1;
     next.state.turn = 8;
     mock.update(next);
     await act(async () => {
+      socket.emit("command_status", {
+        id: JSON.parse(socket.sent.at(-1)!).id,
+        status: "completed",
+      });
       socket.emit("room_state", { refresh: true });
     });
     expect(await screen.findByText("Раунд 2 · Ходит Tester")).toBeTruthy();
@@ -357,10 +488,12 @@ describe("adventure onboarding", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Пропустить мой ход" }),
     );
-    expect(socket.sent.map((v) => JSON.parse(v))).toContainEqual({
-      type: "pass_turn",
-      data: {},
-    });
+    expect(socket.sent.map((v) => JSON.parse(v))).toContainEqual(
+      expect.objectContaining({
+        type: "pass_turn",
+        data: {},
+      }),
+    );
   });
 
   it("creates a prepared adventure without a settings form", async () => {
@@ -420,10 +553,12 @@ describe("adventure onboarding", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Я готов к приключению" }),
     );
-    expect(socket.sent.map((s) => JSON.parse(s))).toContainEqual({
-      type: "ready",
-      data: { ready: true },
-    });
+    expect(socket.sent.map((s) => JSON.parse(s))).toContainEqual(
+      expect.objectContaining({
+        type: "ready",
+        data: { ready: true },
+      }),
+    );
     const ready = structuredClone(current);
     ready.members.forEach((m) => {
       m.ready = true;
@@ -436,6 +571,10 @@ describe("adventure onboarding", () => {
     });
     mock.update(ready);
     await act(async () => {
+      socket.emit("command_status", {
+        id: JSON.parse(socket.sent.at(-1)!).id,
+        status: "completed",
+      });
       socket.emit("room_state", { refresh: true });
     });
     await waitFor(() =>
@@ -450,21 +589,25 @@ describe("adventure onboarding", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Начать приключение" }),
     );
-    expect(socket.sent.map((s) => JSON.parse(s))).toContainEqual({
-      type: "start_game",
-      data: {},
-    });
+    expect(socket.sent.map((s) => JSON.parse(s))).toContainEqual(
+      expect.objectContaining({
+        type: "start_game",
+        data: {},
+      }),
+    );
     await act(async () => {
       socket.emit("game_status_changed", { processing: true });
     });
     expect(screen.getByText("Мастер готовит вступление…")).toBeTruthy();
     await act(async () => {
-      socket.emit("error", { message: "Не удалось создать вступление" });
+      socket.emit("command_status", {
+        id: JSON.parse(socket.sent.at(-1)!).id,
+        status: "failed",
+        message: "Не удалось создать вступление",
+      });
       socket.emit("game_status_changed", { processing: false });
     });
-    expect(screen.getByRole("alert").textContent).toContain(
-      "Не удалось создать вступление",
-    );
+    expect(screen.getByText("Не удалось создать вступление")).toBeTruthy();
     await userEvent.click(
       screen.getByRole("button", { name: "Открыть отряд" }),
     );

@@ -122,6 +122,19 @@ func (s *Server) mutate(ctx context.Context, roomID string, user int64, allowJoi
 	if !allowJoin && !isMember(room.Members, user) {
 		return room, denied()
 	}
+	identity, _ := ctx.Value(commandKey{}).(*commandIdentity)
+	if identity != nil {
+		events, found, err := readCommandReceipt(ctx, tx, u, user, identity)
+		if err != nil {
+			return room, err
+		}
+		if found {
+			if receipt, _ := ctx.Value(receiptKey{}).(*commandReceipt); receipt != nil {
+				receipt.Events = events
+			}
+			return room, nil
+		}
+	}
 	if kind, _ := ctx.Value(operationKey{}).(string); kind != "" && s.Hub != nil {
 		name := "Игрок"
 		for _, m := range room.Members {
@@ -140,6 +153,7 @@ func (s *Server) mutate(ctx context.Context, roomID string, user int64, allowJoi
 		return room, e
 	}
 	previousTurn := room.State.Turn
+	previousStatus := room.Status
 	if e = fn(q, &room); e != nil {
 		return room, e
 	}
@@ -175,10 +189,19 @@ func (s *Server) mutate(ctx context.Context, roomID string, user int64, allowJoi
 		if hero := room.State.CombatHero(); hero != nil {
 			message += "\n\nСейчас ходит: " + hero.Name
 		}
+		if room.Status == "FINISHED" && previousStatus != "FINISHED" {
+			message += "\n\n" + describeEnding(room)
+		}
 		_, e = tx.Exec(ctx, `INSERT INTO telegram_outbox(room_id,user_id,body)
  SELECT s.room_id,s.user_id,$3 FROM bot_sessions s
  JOIN room_members m ON m.room_id=s.room_id AND m.user_id=s.user_id
  WHERE s.room_id=$1 AND s.user_id<>$2 AND s.notifications`, u, exclude, message)
+		if e != nil {
+			return room, e
+		}
+	}
+	if identity != nil {
+		_, e = tx.Exec(ctx, "INSERT INTO command_receipts(room_id,user_id,command_id,request_hash,events) VALUES($1,$2,$3,$4,$5)", u, user, identity.ID, identity.Hash, blob(fresh))
 		if e != nil {
 			return room, e
 		}
@@ -497,6 +520,9 @@ func (s *Server) startGame(ctx context.Context, rid string, user int64) error {
 	_, e := s.mutate(ctx, rid, user, false, func(q *store.Queries, room *Room) error {
 		if !CanManage(room.OwnerID, user) {
 			return denied()
+		}
+		if room.Status == "FINISHED" {
+			return bad("Кампания завершена. Создай новое приключение; история этой кампании сохранена.")
 		}
 		if room.Status != "WAITING" && room.Status != "PAUSED" {
 			return bad("Игра уже запущена")

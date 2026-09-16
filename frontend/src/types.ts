@@ -38,6 +38,7 @@ export type Room = {
   inviteUrl: string;
   members: { userId: number; name: string; role: string; ready: boolean }[];
   state: {
+    ending?: { reason: "owner" | "defeat"; note: string; finishedAt: string };
     settings: Settings;
     characters: Hero[];
     npcs: {

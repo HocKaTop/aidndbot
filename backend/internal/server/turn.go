@@ -13,11 +13,27 @@ import (
 )
 
 func (s *Server) command(ctx context.Context, rid string, user int64, cmd Command) error {
+	identity, err := identifyCommand(cmd)
+	if err != nil {
+		return err
+	}
+	if identity != nil {
+		ctx = context.WithValue(ctx, commandKey{}, identity)
+	}
 	ctx = context.WithValue(ctx, operationKey{}, cmd.Type)
 	if cmd.Type == "start_game" {
 		return s.startGame(ctx, rid, user)
 	}
 	_, e := s.mutate(ctx, rid, user, false, func(q *store.Queries, r *Room) error {
+		if cmd.ExpectedTurn != nil && *cmd.ExpectedTurn != r.State.Turn {
+			return bad("Ситуация уже изменилась. Посмотри последние события и отправь новое действие.")
+		}
+		if cmd.Type == "finish_game" {
+			return s.finishCampaign(ctx, q, r, user, cmd.Data.Code, cmd.Data.Text)
+		}
+		if r.Status == "FINISHED" {
+			return bad("Кампания завершена. Можно перечитать историю или создать новое приключение.")
+		}
 		if cmd.Type == "ready" {
 			if r.Status != "WAITING" {
 				return bad("Игра уже началась")
@@ -144,9 +160,7 @@ func settleTurn(r *Room, user int64, wasCombat bool, results []game.Result) ([]g
 	}
 	results = append(results, retaliation...)
 	if r.State.PartyDefeated() {
-		r.State.Combat = false
-		r.Status = "FINISHED"
-		results = append(results, game.Result{Type: "GAME_FINISHED", Text: "Весь отряд пал. Кампания завершена; её историю можно перечитать."})
+		results = append(results, endCampaign(r, "defeat", "Весь отряд пал. Кампания завершена; её историю можно перечитать."))
 	} else if wasCombat && !r.State.Combat {
 		results = append(results, game.Result{Type: "COMBAT_ENDED", Text: "Все противники в текущей сцене побеждены. Бой завершён."})
 	}
