@@ -23,10 +23,14 @@ export type Hero = {
   name: string;
   race: string;
   class: string;
+  classId?: "warrior" | "rogue" | "mage";
   level: number;
+  experience?: number;
   hp: number;
   maxHp: number;
   armorClass: number;
+  resource?: number;
+  resourceMax?: number;
   stats: Record<string, number>;
   inventory: Item[];
 };
@@ -38,7 +42,12 @@ export type Room = {
   inviteUrl: string;
   members: { userId: number; name: string; role: string; ready: boolean }[];
   state: {
-    ending?: { reason: "owner" | "defeat"; note: string; finishedAt: string };
+    pendingQuestCompletion?: { questId: string; reason: string };
+    ending?: {
+      reason: "owner" | "defeat" | "objective";
+      note: string;
+      finishedAt: string;
+    };
     settings: Settings;
     characters: Hero[];
     npcs: {
@@ -49,6 +58,7 @@ export type Room = {
       maxHp: number;
       alive: boolean;
       disposition: string;
+      location?: string;
     }[];
     quests: {
       id: string;
@@ -71,3 +81,5 @@ export type GameEvent = {
   createdAt: string;
   payload: { text?: string; roll?: { notation: string; total: number } };
 };
+export type HistoryEvent = GameEvent & { sequence: string };
+export type HistoryPage = { events: HistoryEvent[]; nextCursor: string | null };

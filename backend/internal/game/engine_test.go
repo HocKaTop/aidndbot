@@ -1,6 +1,45 @@
 package game
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestNegotiationRequiresCheckAndChangesOnlyLivingLocalNPC(t *testing.T) {
+	for _, success := range []bool{false, true} {
+		s := NewState(Settings{})
+		s.Characters = []Character{NewCharacter(1, "Hero", "", "")}
+		s.Scene = &Scene{Location: "mill"}
+		s.NPCs = []NPC{{ID: "thief", HP: 12, MaxHP: 12, Alive: true, Disposition: "hostile", Location: "mill"}}
+		s.Combat = true
+		peace := Action{Type: "SET_DISPOSITION", Target: "thief", Status: "neutral"}
+		if _, err := ApplyActions(&s, 1, []Action{peace}); err == nil {
+			t.Fatal("free combat escape accepted")
+		}
+		s.Characters[0].Stats.Charisma = 0
+		if success {
+			s.Characters[0].Stats.Charisma = 60
+		}
+		results, err := ApplyActions(&s, 1, []Action{{Type: "SKILL_CHECK", Skill: "charisma", DC: 25}, peace})
+		if err != nil || *results[0].Success != success {
+			t.Fatal(err, results)
+		}
+		want := "hostile"
+		if success {
+			want = "neutral"
+		}
+		if s.NPCs[0].Disposition != want || s.NPCs[0].HP != 12 {
+			t.Fatal("negotiation ignored check or changed HP")
+		}
+		for _, npc := range []NPC{{ID: "dead", Alive: false, Location: "mill"}, {ID: "remote", Alive: true, Location: "forest"}} {
+			s.NPCs = append(s.NPCs, npc)
+			if ValidateAction(&s, 1, Action{Type: "SET_DISPOSITION", Target: npc.ID, Status: "friendly"}) == nil {
+				t.Fatal("changed dead/remote NPC")
+			}
+		}
+	}
+}
 
 func TestDice(t *testing.T) {
 	for _, s := range []string{"d20", "d6", "2d6", "2d6+3", "1d20+5", "1d8-1"} {
@@ -29,6 +68,70 @@ func TestCombat(t *testing.T) {
 		t.Fatal("bounds")
 	}
 }
+
+func TestAttackCriticalAndDeath(t *testing.T) {
+	for _, tc := range []struct {
+		natural int
+		armor   int
+		wantHit bool
+		wantHP  int
+	}{
+		{1, 1, false, 9},
+		{20, 99, true, 0},
+		{10, 12, true, 2},
+	} {
+		calls := 0
+		result, err := attackWithRoll("Enemy", 9, tc.armor, 2, "1d8+2", func(notation string) (Roll, error) {
+			calls++
+			switch notation {
+			case "d20":
+				return Roll{Notation: notation, Rolls: []int{tc.natural}, Total: tc.natural}, nil
+			case "1d8+2":
+				return Roll{Notation: notation, Rolls: []int{5}, Total: 7}, nil
+			default:
+				return Roll{}, errors.New("unexpected dice")
+			}
+		})
+		if err != nil || result.Hit != tc.wantHit || result.TargetHP != tc.wantHP {
+			t.Fatal("attack outcome", tc, result, err)
+		}
+		if tc.natural == 1 && calls != 1 || tc.natural == 20 && result.Damage != 14 {
+			t.Fatal("critical damage or miss rules", tc, result, calls)
+		}
+	}
+}
+
+func TestEnemyResponsesRotateAndDefenseChangesArmor(t *testing.T) {
+	s := NewState(Settings{})
+	hero := NewCharacter(1, "Hero", "", "")
+	hero.MaxHP, hero.HP = 100, 100
+	s.Characters = []Character{hero}
+	s.Scene = &Scene{Location: "mill"}
+	s.NPCs = []NPC{
+		{Name: "First", HP: 12, Alive: true, Disposition: "hostile", Location: "mill"},
+		{Name: "Remote", HP: 12, Alive: true, Disposition: "hostile", Location: "forest"},
+		{Name: "Second", HP: 12, Alive: true, Disposition: "hostile", Location: "mill"},
+	}
+	s.Combat = true
+	for i, name := range []string{"First", "Second", "First"} {
+		bonus := 0
+		if i == 1 {
+			bonus = 2
+		}
+		before := s.Hero(1).HP
+		results, err := Retaliate(&s, 1, bonus)
+		if err != nil || len(results) != 1 || !strings.HasPrefix(results[0].Text, name+" атакует") {
+			t.Fatal("wrong enemy response", i, results, err)
+		}
+		attack := results[0].Attack
+		if attack.Hit != Hits(attack.Roll.Total, 2, 13+bonus) || s.Hero(1).HP != before-attack.Damage {
+			t.Fatal("defense or damage ignored", attack, before, s.Hero(1).HP)
+		}
+	}
+	if s.NPCResponseCount != 3 {
+		t.Fatal("enemy response position not saved")
+	}
+}
 func TestActionValidation(t *testing.T) {
 	s := NewState(Settings{})
 	s.Characters = append(s.Characters, NewCharacter(1, "A", "human", "warrior"))
@@ -48,6 +151,36 @@ func TestActionValidation(t *testing.T) {
 	}
 }
 
+func TestCampaignFinaleRequiresCompletedGoalsAndNoCombat(t *testing.T) {
+	s := NewState(Settings{Name: "Экспедиция"})
+	s.Characters = []Character{NewCharacter(1, "Hero", "Human", "Warrior")}
+	s.Quests = []Quest{{ID: "signal", Status: "ACTIVE"}}
+	finish := Action{Type: "FINISH_CAMPAIGN"}
+	if err := ValidateActions(&s, 1, []Action{finish}); err == nil {
+		t.Fatal("active quest allowed finale")
+	}
+	plan := []Action{{Type: "UPDATE_QUEST", Target: "signal", Status: "COMPLETED"}, finish}
+	if err := ValidateActions(&s, 1, plan); err == nil {
+		t.Fatal("AI completed custom objective without confirmation")
+	}
+	proposal := Action{Type: "PROPOSE_QUEST_COMPLETION", Target: "signal", Description: "Передатчик включён и сигнал принят."}
+	if err := ValidateActions(&s, 1, []Action{proposal}); err != nil {
+		t.Fatal(err)
+	}
+	s.Combat = true
+	if err := ValidateActions(&s, 1, []Action{proposal}); err == nil {
+		t.Fatal("combat proposal accepted")
+	}
+	s.Combat = false
+	results, err := ApplyActions(&s, 1, []Action{proposal})
+	if err != nil || len(results) != 1 || results[0].Type != "PROPOSE_QUEST_COMPLETION" || s.Quests[0].Status != "ACTIVE" || s.PendingQuestCompletion == nil {
+		t.Fatal(results, err)
+	}
+	if err := ValidateActions(&s, 1, []Action{proposal}); err == nil {
+		t.Fatal("duplicate proposal accepted")
+	}
+}
+
 func TestSceneAndInventoryRules(t *testing.T) {
 	s := NewState(Settings{})
 	s.Characters = append(s.Characters, NewCharacter(1, "Hero", "Human", "Warrior"))
@@ -60,7 +193,7 @@ func TestSceneAndInventoryRules(t *testing.T) {
 	if ValidateAction(&s, 1, Action{Type: "ATTACK", Target: "remote"}) == nil {
 		t.Fatal("remote attack accepted")
 	}
-	results, e := Retaliate(&s, 1)
+	results, e := Retaliate(&s, 1, 0)
 	if e != nil || len(results) != 0 || s.Characters[0].HP != 20 {
 		t.Fatal("remote enemy retaliated", results, e)
 	}

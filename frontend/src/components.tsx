@@ -48,7 +48,11 @@ export function SettingsForm({
     >
       {field("name", "Название кампании")}
       {field("setting", "Сеттинг")}
-      {field("worldDescription", "Мир и начало истории", true)}
+      {field("worldDescription", "Что важно в этом мире", true)}
+      <small>
+        Достаточно пары предложений о мире. Главную цель, начальную сцену и
+        персонажей придумает ведущий.
+      </small>
       <div className="two">
         {field("tone", "Тон повествования")}
         {field("difficulty", "Сложность")}
@@ -99,6 +103,19 @@ export function HeroCard({ hero }: { hero: Hero }) {
         <Shield size={18} />
         <strong>{hero.armorClass}</strong>
       </div>
+      {hero.classId && (
+        <p>
+          {hero.classId === "mage"
+            ? "Мана"
+            : hero.classId === "rogue"
+              ? "Фокус"
+              : "Выносливость"}: {hero.resource ?? 0}/{hero.resourceMax ?? 0}
+        </p>
+      )}
+      <p>
+        Опыт: {hero.experience ?? 0}
+        {hero.level < 3 ? ` / ${hero.level === 1 ? 100 : 250}` : " · максимальный уровень"}
+      </p>
       <div className="health">
         <i style={{ width: `${(hero.hp / hero.maxHp) * 100}%` }} />
       </div>

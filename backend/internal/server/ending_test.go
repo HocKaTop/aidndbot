@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"dnd-bot/backend/internal/ai"
 	"dnd-bot/backend/internal/auth"
 	"dnd-bot/backend/internal/game"
 	"dnd-bot/backend/internal/store"
@@ -8,6 +10,107 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestCustomCampaignFinaleRequiresOwnerConfirmation(t *testing.T) {
+	ctx, s, _ := reviewServer(t)
+	r := testCampaign(t, ctx, s, 1)
+	var err error
+	r, err = s.mutate(ctx, r.ID, 1, false, func(_ *store.Queries, r *Room) error {
+		r.Status = "PLAYING"
+		r.State.Scene = &game.Scene{ID: uuid.NewString(), Title: "Орбитальная станция", Location: "Орбита"}
+		r.State.Quests = []game.Quest{{ID: uuid.NewString(), Title: "Восстановить сигнал", Status: "ACTIVE"}}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.AI = openingProvider(func(_ context.Context, _ string, in ai.Input) (ai.Output, error) {
+		if in.Results != nil {
+			if in.State.PendingQuestCompletion == nil || in.State.Quests[0].Status != "ACTIVE" {
+				t.Fatal("narration did not receive pending proposal")
+			}
+			return ai.Output{Narrative: "Сигнал принят. Ведущий предлагает завершить цель; можно подтвердить или продолжить."}, nil
+		}
+		return ai.Output{Actions: []game.Action{{Type: "PROPOSE_QUEST_COMPLETION", Target: in.State.Quests[0].ID, Description: "Сигнал принят командованием."}}, Narrative: "Сигнал принят; ожидается решение отряда."}, nil
+	})
+	cmd := Command{Type: "player_action", ExpectedTurn: &r.State.Turn}
+	cmd.Data.Text = "Восстанавливаю сигнал и возвращаюсь домой"
+	if err := s.command(ctx, r.ID, 1, cmd); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.load(ctx, r.ID, 1)
+	if err != nil || loaded.Status != "PLAYING" || loaded.State.PendingQuestCompletion == nil || loaded.State.Quests[0].Status != "ACTIVE" {
+		t.Fatal("AI proposal did not keep campaign active", loaded, err)
+	}
+	if err := s.command(ctx, r.ID, 1, Command{Type: "continue_quest", ExpectedTurn: &loaded.State.Turn}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.load(ctx, r.ID, 1)
+	if err != nil || loaded.State.PendingQuestCompletion != nil || loaded.State.Quests[0].Status != "ACTIVE" || loaded.State.Characters[0].Experience != 0 {
+		t.Fatal("declined proposal changed goal or rewards", loaded, err)
+	}
+	cmd.ExpectedTurn = &loaded.State.Turn
+	if err := s.command(ctx, r.ID, 1, cmd); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.load(ctx, r.ID, 1)
+	if err != nil || loaded.State.PendingQuestCompletion == nil {
+		t.Fatal("second proposal missing", err)
+	}
+	confirm := Command{Type: "confirm_quest", ExpectedTurn: &loaded.State.Turn}
+	if err := s.command(ctx, r.ID, 1, confirm); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.load(ctx, r.ID, 1)
+	if err != nil || loaded.Status != "FINISHED" || loaded.State.Ending == nil || loaded.State.Ending.Reason != "objective" || loaded.State.Quests[0].Status != "COMPLETED" || loaded.State.PendingQuestCompletion != nil || loaded.State.Characters[0].Experience != 100 {
+		t.Fatal("confirmed finale not saved", loaded, err)
+	}
+	events, err := s.eventList(ctx, r.ID)
+	if err != nil || len(events) < 3 || events[len(events)-1].Type != "GAME_FINISHED" {
+		t.Fatal("finale event missing", events, err)
+	}
+	if err := s.command(ctx, r.ID, 1, cmd); err == nil {
+		t.Fatal("finished campaign accepted another turn")
+	}
+}
+
+func TestReopenLegacyQuestDoesNotGrantExperienceTwice(t *testing.T) {
+	ctx, s, _ := reviewServer(t)
+	r := testCampaign(t, ctx, s, 1)
+	questID := uuid.NewString()
+	_, err := s.mutate(ctx, r.ID, 1, false, func(_ *store.Queries, r *Room) error {
+		r.Status = "PLAYING"
+		r.State.Quests = []game.Quest{{ID: questID, Title: "Найти Маркова", Status: "COMPLETED"}}
+		r.State.Characters[0].Experience = 100
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopen := Command{Type: "reopen_quest"}
+	reopen.Data.Target = questID
+	if err := s.command(ctx, r.ID, 1, reopen); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.load(ctx, r.ID, 1)
+	if err != nil || loaded.State.Quests[0].Status != "ACTIVE" || !loaded.State.Quests[0].Rewarded || loaded.State.Characters[0].Experience != 100 {
+		t.Fatal("legacy quest not restored safely", err)
+	}
+	_, err = s.mutate(ctx, r.ID, 1, false, func(_ *store.Queries, r *Room) error {
+		r.State.PendingQuestCompletion = &game.QuestCompletionProposal{QuestID: questID, Reason: "Марков найден."}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.command(ctx, r.ID, 1, Command{Type: "confirm_quest"}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.load(ctx, r.ID, 1)
+	if err != nil || loaded.Status != "FINISHED" || loaded.State.Characters[0].Experience != 100 {
+		t.Fatal("reopened quest granted duplicate experience", err)
+	}
+}
 
 func TestFinishCampaignPersistsOnceAndFreezesWorld(t *testing.T) {
 	ctx, s, _ := reviewServer(t)

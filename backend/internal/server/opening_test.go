@@ -158,3 +158,33 @@ func TestLiveOpening(t *testing.T) {
 	}
 	t.Logf("%s: opening, scene and quest validated in %s", model, time.Since(started).Round(time.Millisecond))
 }
+
+// Opt-in: verifies that an owner-defined non-fantasy setting reaches the
+// opening planner and produces a usable scene, goal and private story notes.
+func TestLiveCustomSettingOpening(t *testing.T) {
+	endpoint, model := os.Getenv("OLLAMA_SMOKE_URL"), os.Getenv("OLLAMA_SMOKE_MODEL")
+	if endpoint == "" || model == "" {
+		t.Skip("set OLLAMA_SMOKE_URL and OLLAMA_SMOKE_MODEL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	state := game.NewState(game.Settings{
+		Name: "Сигнал в глубине", Setting: "Научная фантастика", Tone: "Напряжённое расследование", OllamaModel: model,
+		WorldDescription: "2080 год. Отряд прибывает на подводную исследовательскую станцию, откуда пропала связь. В этом мире нет магии и фэнтезийных существ. Придумай загадку и первую цель сам.",
+	})
+	state.Characters = []game.Character{game.NewCharacter(1, "Олег", "Человек", "Воин")}
+	s := &Server{AI: ai.New(endpoint)}
+	out, err := s.planTurn(ctx, "synthetic", ai.Input{Opening: true, State: state, PlayerID: 1, Text: "Открой приключение."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOpening(out.Actions); err != nil || len(out.Memory) == 0 {
+		t.Fatal("custom setting did not produce a scene, goal and private plot hook", err, out)
+	}
+	for _, forbidden := range []string{"эльф", "магия", "заклинание", "таверна"} {
+		if strings.Contains(strings.ToLower(out.Narrative), forbidden) {
+			t.Fatalf("fantasy element %q ignored owner's setting: %s", forbidden, out.Narrative)
+		}
+	}
+	t.Logf("opening: %s; notes: %v", out.Narrative, out.Memory)
+}

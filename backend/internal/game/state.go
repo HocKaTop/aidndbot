@@ -3,6 +3,7 @@ package game
 import (
 	"github.com/google/uuid"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,14 @@ type Settings struct {
 	OllamaModel      string `json:"ollamaModel"`
 	MaxPlayers       int    `json:"maxPlayers"`
 }
+
+// Existing quick adventures did not store a scenario ID, so recognize their
+// original template as well as newly created rooms without changing old data.
+func (s Settings) LastLantern() bool {
+	description := strings.ToLower(s.WorldDescription)
+	return s.Name == "Последний фонарь" && strings.Contains(description, "тихий брод") && strings.Contains(description, "огненный камень")
+}
+
 type Stats struct {
 	Strength     int `json:"strength"`
 	Dexterity    int `json:"dexterity"`
@@ -33,18 +42,21 @@ type Item struct {
 	Type        string `json:"type"`
 }
 type Character struct {
-	ID         string `json:"id"`
-	UserID     int64  `json:"userId"`
-	Name       string `json:"name"`
-	Race       string `json:"race"`
-	Class      string `json:"class"`
-	Level      int    `json:"level"`
-	HP         int    `json:"hp"`
-	MaxHP      int    `json:"maxHp"`
-	ArmorClass int    `json:"armorClass"`
-	Experience int    `json:"experience"`
-	Stats      Stats  `json:"stats"`
-	Inventory  []Item `json:"inventory"`
+	ID          string `json:"id"`
+	UserID      int64  `json:"userId"`
+	Name        string `json:"name"`
+	Race        string `json:"race"`
+	Class       string `json:"class"`
+	ClassID     string `json:"classId,omitempty"`
+	Level       int    `json:"level"`
+	HP          int    `json:"hp"`
+	MaxHP       int    `json:"maxHp"`
+	ArmorClass  int    `json:"armorClass"`
+	Experience  int    `json:"experience"`
+	Resource    int    `json:"resource,omitempty"`
+	ResourceMax int    `json:"resourceMax,omitempty"`
+	Stats       Stats  `json:"stats"`
+	Inventory   []Item `json:"inventory"`
 }
 type NPC struct {
 	ID          string `json:"id"`
@@ -62,6 +74,7 @@ type Quest struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Status      string `json:"status"`
+	Rewarded    bool   `json:"rewarded,omitempty"`
 }
 type Scene struct {
 	ID          string `json:"id"`
@@ -69,20 +82,27 @@ type Scene struct {
 	Description string `json:"description"`
 	Location    string `json:"location"`
 }
+type QuestCompletionProposal struct {
+	QuestID string `json:"questId"`
+	Reason  string `json:"reason"`
+}
 type State struct {
-	Ending          *Ending     `json:"ending,omitempty"`
-	Settings        Settings    `json:"settings"`
-	Characters      []Character `json:"characters"`
-	NPCs            []NPC       `json:"npcs"`
-	Quests          []Quest     `json:"quests"`
-	Scene           *Scene      `json:"scene"`
-	Combat          bool        `json:"combat"`
-	CombatOrder     []int64     `json:"combatOrder,omitempty"`
-	CombatIndex     int         `json:"combatIndex"`
-	CombatRound     int         `json:"combatRound"`
-	CombatTurnSince time.Time   `json:"combatTurnSince"`
-	Summary         string      `json:"summary"`
-	Turn            int         `json:"turn"`
+	Ending                 *Ending                  `json:"ending,omitempty"`
+	PendingQuestCompletion *QuestCompletionProposal `json:"pendingQuestCompletion,omitempty"`
+	Settings               Settings                 `json:"settings"`
+	Characters             []Character              `json:"characters"`
+	NPCs                   []NPC                    `json:"npcs"`
+	Quests                 []Quest                  `json:"quests"`
+	Scene                  *Scene                   `json:"scene"`
+	Combat                 bool                     `json:"combat"`
+	CombatOrder            []int64                  `json:"combatOrder,omitempty"`
+	CombatIndex            int                      `json:"combatIndex"`
+	CombatRound            int                      `json:"combatRound"`
+	CombatTurnSince        time.Time                `json:"combatTurnSince"`
+	NPCResponseCount       int                      `json:"npcResponseCount,omitempty"`
+	Summary                string                   `json:"summary"`
+	GMNotes                []string                 `json:"gmNotes,omitempty"`
+	Turn                   int                      `json:"turn"`
 }
 
 type Ending struct {
@@ -108,9 +128,14 @@ func (s State) Clone() State {
 	}
 	s.NPCs = slices.Clone(s.NPCs)
 	s.Quests = slices.Clone(s.Quests)
+	s.GMNotes = slices.Clone(s.GMNotes)
 	if s.Scene != nil {
 		scene := *s.Scene
 		s.Scene = &scene
+	}
+	if s.PendingQuestCompletion != nil {
+		proposal := *s.PendingQuestCompletion
+		s.PendingQuestCompletion = &proposal
 	}
 	return s
 }

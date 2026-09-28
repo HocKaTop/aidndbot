@@ -21,14 +21,18 @@ func ApplyDamage(hp, damage int) int {
 	return hp - damage
 }
 func Attack(target string, hp, ac, modifier int, damage string) (AttackResult, error) {
-	r, e := RollDice("d20")
+	return attackWithRoll(target, hp, ac, modifier, damage, RollDice)
+}
+
+func attackWithRoll(target string, hp, ac, modifier int, damage string, roll func(string) (Roll, error)) (AttackResult, error) {
+	r, e := roll("d20")
 	out := AttackResult{Target: target, Roll: r, TargetHP: hp}
 	if e != nil {
 		return out, e
 	}
 	out.Hit = Hits(r.Total, modifier, ac)
 	if out.Hit {
-		d, e := RollDice(damage)
+		d, e := roll(damage)
 		if e != nil {
 			return out, e
 		}

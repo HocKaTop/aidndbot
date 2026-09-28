@@ -8,6 +8,7 @@ import (
 	"dnd-bot/backend/internal/game"
 	"dnd-bot/backend/internal/notifications"
 	"dnd-bot/backend/internal/store"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -236,6 +237,42 @@ func TestCombatTurnsSkipAndPersistence(t *testing.T) {
 	events, err := s.eventList(ctx, r.ID)
 	if err != nil || len(events) != 6 || events[4].Type != "NPC_ATTACK" || events[5].Type != "TURN_CHANGED" {
 		t.Fatal("skipping bypassed retaliation", events, err)
+	}
+}
+
+func TestDefendTurnPersistsAndUsesHigherArmor(t *testing.T) {
+	ctx, s, _ := reviewServer(t)
+	r := multiplayerRoom(t, ctx, s)
+	r, err := s.mutate(ctx, r.ID, 1, false, func(_ *store.Queries, r *Room) error {
+		r.State.Combat = true
+		r.State.NPCs = []game.NPC{{ID: "3c1f9f12-1d85-4d7b-9c4d-b0a4f3bdad27", Name: "Враг", HP: 12, MaxHP: 12, Alive: true, Disposition: "hostile", Location: "Мост"}}
+		r.State.EnsureCombatOrder(1, time.Now())
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := Command{Type: "defend_turn", ExpectedTurn: &r.State.Turn}
+	if err = s.command(ctx, r.ID, 2, cmd); err == nil {
+		t.Fatal("other hero defended out of turn")
+	}
+	if err = s.command(ctx, r.ID, 1, cmd); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.load(ctx, r.ID, 1)
+	if err != nil || loaded.State.Turn != 1 || loaded.State.CombatHero().UserID != 2 || loaded.State.NPCResponseCount != 1 {
+		t.Fatal("defense did not save turn and enemy response", err)
+	}
+	events, err := s.eventList(ctx, r.ID)
+	if err != nil || len(events) != 3 || events[0].Type != "DEFEND" || events[1].Type != "NPC_ATTACK" || events[2].Type != "TURN_CHANGED" {
+		t.Fatal("defense events missing", events, err)
+	}
+	var attack game.Result
+	if err = json.Unmarshal(events[1].Payload, &attack); err != nil || attack.Attack == nil {
+		t.Fatal("enemy roll missing", err)
+	}
+	if attack.Attack.Hit != game.Hits(attack.Attack.Roll.Total, 2, 15) || loaded.State.Hero(1).HP != 20-attack.Attack.Damage {
+		t.Fatal("defense bonus ignored", attack, loaded.State.Hero(1).HP)
 	}
 }
 

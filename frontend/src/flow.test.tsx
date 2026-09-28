@@ -66,7 +66,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
-function backend(userId = 1) {
+function backend(userId = 1, fixture = room) {
   let deleted = false;
   const fetcher = vi.fn(
     async (input: string | URL | Request, init?: RequestInit) => {
@@ -78,12 +78,13 @@ function backend(userId = 1) {
           token: "test-session",
         };
       else if (path === "/api/rooms")
-        data = init?.method === "POST" ? room : deleted ? [] : [room];
-      else if (path.endsWith("/events")) data = [];
+        data = init?.method === "POST" ? fixture : deleted ? [] : [fixture];
+      else if (path.includes("/events/page"))
+        data = { events: [], nextCursor: null };
       else if (init?.method === "DELETE") {
         deleted = true;
         data = { deleted: true };
-      } else data = room;
+      } else data = fixture;
       return { ok: true, status: 200, json: async () => data } as Response;
     },
   );
@@ -261,6 +262,30 @@ it("restores the processing player on reconnect and clears it when the turn ends
 });
 
 describe("adventure onboarding", () => {
+  function lanternRoom(place: string): Room {
+    const current = structuredClone(room);
+    current.status = "PLAYING";
+    current.state.settings.name = "Последний фонарь";
+    current.state.settings.worldDescription =
+      "Тихий Брод: пропал огненный камень";
+    current.state.scene = { title: place, location: place, description: "" };
+    current.state.characters = [
+      {
+        id: "hero",
+        userId: 1,
+        name: "Олег",
+        race: "Человек",
+        class: "Воин",
+        level: 1,
+        hp: 20,
+        maxHp: 20,
+        armorClass: 13,
+        stats: {},
+        inventory: [],
+      },
+    ];
+    return current;
+  }
   function setup(initial: Room, userId = 1) {
     let current = initial;
     const fetcher = vi.fn(async (input: string | URL | Request) => {
@@ -273,14 +298,18 @@ describe("adventure onboarding", () => {
             }
           : path === "/api/rooms"
             ? [current]
-            : path.endsWith("/events")
-              ? [
-                  {
-                    id: "intro",
-                    type: "GM_MESSAGE",
-                    payload: { text: "Фонарь погас. Что вы делаете?" },
-                  },
-                ]
+            : path.includes("/events/page")
+              ? {
+                  events: [
+                    {
+                      id: "intro",
+                      sequence: "1",
+                      type: "GM_MESSAGE",
+                      payload: { text: "Фонарь погас. Что вы делаете?" },
+                    },
+                  ],
+                  nextCursor: null,
+                }
               : current;
       return { ok: true, status: 200, json: async () => data } as Response;
     });
@@ -292,6 +321,92 @@ describe("adventure onboarding", () => {
       },
     };
   }
+
+  it("offers a guaranteed way to claim the stone after the thief yields", async () => {
+    const current = lanternRoom("Старая мельница");
+    current.state.npcs = [
+      {
+        id: "thief",
+        name: "Похититель",
+        description: "",
+        hp: 0,
+        maxHp: 12,
+        alive: false,
+        disposition: "hostile",
+        location: "Старая мельница",
+      },
+    ];
+    setup(current);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Последний фонарь/ }),
+    );
+    const ws = FakeSocket.sockets.at(-1)!;
+    act(() => {
+      ws.onopen?.();
+      ws.emit("room_state", { refresh: true });
+    });
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Забрать огненный камень" }),
+    );
+    expect(JSON.parse(ws.sent.at(-1)!).type).toBe("claim_stone");
+  });
+
+  it("offers the verified finale when the carrier reaches the bridge", async () => {
+    const current = lanternRoom("Старый мост");
+    current.state.characters[0].inventory = [
+      {
+        id: "stone",
+        name: "Огненный камень",
+        description: "",
+        type: "QUEST",
+        quantity: 1,
+      },
+    ];
+    setup(current);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Последний фонарь/ }),
+    );
+    const ws = FakeSocket.sockets.at(-1)!;
+    act(() => {
+      ws.onopen?.();
+      ws.emit("room_state", { refresh: true });
+    });
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "Установить камень и завершить приключение",
+      }),
+    );
+    expect(JSON.parse(ws.sent.at(-1)!).type).toBe("install_stone");
+  });
+
+  it("offers a direct return when the carrier is still at the mill", async () => {
+    const current = lanternRoom("Старая мельница");
+    current.state.characters[0].inventory = [
+      {
+        id: "stone",
+        name: "Огненный камень",
+        description: "",
+        type: "QUEST",
+        quantity: 1,
+      },
+    ];
+    setup(current);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Последний фонарь/ }),
+    );
+    const ws = FakeSocket.sockets.at(-1)!;
+    act(() => {
+      ws.onopen?.();
+      ws.emit("room_state", { refresh: true });
+    });
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Вернуться с камнем к мосту" }),
+    );
+    expect(JSON.parse(ws.sent.at(-1)!).type).toBe("return_to_bridge");
+  });
 
   it("confirms finishing, sends a tracked command and shows saved results", async () => {
     const current = structuredClone(room);
@@ -370,9 +485,50 @@ describe("adventure onboarding", () => {
     expect(screen.getByText("Твои кампании")).toBeTruthy();
   });
 
+  it("offers the owner a finale after quests are resolved and stops inviting after start", async () => {
+    const current = structuredClone(room);
+    current.status = "PLAYING";
+    current.state.quests = [
+      {
+        id: "goal",
+        title: "Вернуть свет",
+        description: "",
+        status: "COMPLETED",
+      },
+    ];
+    setup(current);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Тестовая кампания/ }),
+    );
+    await act(async () => {
+      FakeSocket.sockets.at(-1)!.emit("room_state", { refresh: true });
+    });
+    expect(
+      screen.getByRole("heading", { name: "Активных целей больше нет" }),
+    ).toBeTruthy();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Подвести итоги" }),
+    );
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Отмена" }));
+    await userEvent.click(screen.getByRole("button", { name: "Отряд" }));
+    expect(screen.queryByRole("button", { name: /Пригласить друзей/ })).toBe(
+      null,
+    );
+  });
+
   it("hides finishing for non-owners", async () => {
     const current = structuredClone(room);
     current.status = "PAUSED";
+    current.state.quests = [
+      {
+        id: "goal",
+        title: "Вернуть свет",
+        description: "",
+        status: "COMPLETED",
+      },
+    ];
     setup(current, 2);
     render(<App />);
     await userEvent.click(
@@ -381,6 +537,8 @@ describe("adventure onboarding", () => {
     expect(
       screen.queryByRole("button", { name: "Завершить приключение" }),
     ).toBe(null);
+    expect(screen.queryByRole("button", { name: "Подвести итоги" })).toBe(null);
+    expect(screen.getByText(/Обсудите финал с отрядом/)).toBeTruthy();
   });
 
   it("opens legacy defeated campaigns as readable results", async () => {
@@ -426,6 +584,11 @@ describe("adventure onboarding", () => {
     current.state.combatIndex = 0;
     current.state.combatRound = 2;
     current.state.combatTurnSince = new Date(Date.now() - 120000).toISOString();
+    current.state.scene = {
+      title: "Мост",
+      description: "Туман над рекой.",
+      location: "Мост",
+    };
     current.state.characters = [1, 2].map((id) => ({
       id: `hero-${id}`,
       userId: id,
@@ -439,6 +602,18 @@ describe("adventure onboarding", () => {
       stats: {},
       inventory: [],
     }));
+    current.state.npcs = [
+      {
+        id: "npc-1",
+        name: "Элиан",
+        description: "Противник у моста",
+        hp: 10,
+        maxHp: 12,
+        alive: true,
+        disposition: "hostile",
+        location: current.state.scene!.location,
+      },
+    ];
     const mock = setup(current);
     render(<App />);
     await userEvent.click(
@@ -449,6 +624,22 @@ describe("adventure onboarding", () => {
       socket.emit("room_state", { refresh: true, processing: false });
     });
     expect(screen.getByText("Раунд 2 · Ходит Анна")).toBeTruthy();
+    const journal = screen.getByLabelText("История кампании");
+    const queue = screen.getByLabelText("Очередь боя");
+    const targets = screen.getByLabelText("Боевые действия");
+    const composer = screen
+      .getByLabelText("Действие персонажа")
+      .closest("form")!;
+    expect(
+      journal.compareDocumentPosition(queue) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      queue.compareDocumentPosition(targets) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      targets.compareDocumentPosition(composer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(
       (screen.getByLabelText("Действие персонажа") as HTMLTextAreaElement)
         .disabled,
@@ -469,6 +660,9 @@ describe("adventure onboarding", () => {
         data: { turn: 7 },
       }),
     );
+    const sending = screen.getByText("Отправлено — ждём подтверждения");
+    expect(sending.closest(".toast-viewport")).toBeTruthy();
+    expect(sending.closest("main")).toBe(null);
     const next = structuredClone(current);
     next.state.combatIndex = 1;
     next.state.turn = 8;
@@ -486,12 +680,67 @@ describe("adventure onboarding", () => {
         .disabled,
     ).toBe(false);
     await userEvent.click(
+      screen.getByRole("button", { name: "Защищаться · +2 AC" }),
+    );
+    expect(socket.sent.map((v) => JSON.parse(v))).toContainEqual(
+      expect.objectContaining({
+        type: "defend_turn",
+        expectedTurn: 8,
+        data: {},
+      }),
+    );
+    await act(async () => {
+      socket.emit("command_status", {
+        id: JSON.parse(socket.sent.at(-1)!).id,
+        status: "completed",
+      });
+    });
+    await userEvent.click(
       screen.getByRole("button", { name: "Пропустить мой ход" }),
     );
     expect(socket.sent.map((v) => JSON.parse(v))).toContainEqual(
       expect.objectContaining({
         type: "pass_turn",
         data: {},
+      }),
+    );
+  });
+
+  it("offers server-owned attack and class ability against a nearby NPC", async () => {
+    const current = lanternRoom("Старая мельница");
+    current.state.turn = 4;
+    current.state.characters[0].classId = "warrior";
+    current.state.characters[0].resource = 2;
+    current.state.characters[0].resourceMax = 2;
+    current.state.npcs = [
+      {
+        id: "thief",
+        name: "Похититель",
+        description: "",
+        hp: 12,
+        maxHp: 12,
+        alive: true,
+        disposition: "neutral",
+        location: "Старая мельница",
+      },
+    ];
+    setup(current);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Последний фонарь/ }),
+    );
+    const socket = FakeSocket.sockets.at(-1)!;
+    await act(async () => {
+      socket.emit("room_state", { refresh: true });
+    });
+    await userEvent.click(
+      screen.getByRole("button", { name: "Мощный удар · 1 ресурс" }),
+    );
+    expect(socket.sent.map((v) => JSON.parse(v))).toContainEqual(
+      expect.objectContaining({
+        type: "class_ability",
+        expectedTurn: 4,
+        data: { ability: "power_strike", target: "thief" },
       }),
     );
   });
@@ -607,7 +856,15 @@ describe("adventure onboarding", () => {
       });
       socket.emit("game_status_changed", { processing: false });
     });
-    expect(screen.getByText("Не удалось создать вступление")).toBeTruthy();
+    const failure = screen.getByText("Не удалось создать вступление");
+    expect(failure.closest(".toast-viewport")).toBeTruthy();
+    expect(failure.closest("main")).toBe(null);
+    expect(screen.queryByLabelText("Статус действия")).toBe(null);
+    expect(
+      screen.getByRole("button", { name: "Повторить отправку" }).closest(
+        ".toast-viewport",
+      ),
+    ).toBeTruthy();
     await userEvent.click(
       screen.getByRole("button", { name: "Открыть отряд" }),
     );

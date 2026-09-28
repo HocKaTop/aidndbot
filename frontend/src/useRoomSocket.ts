@@ -220,10 +220,16 @@ export function useRoomSocket(
         turn !== undefined &&
         [
           "player_action",
+          "attack_npc",
           "use_item",
+          "class_ability",
           "pass_turn",
+          "defend_turn",
           "skip_turn",
           "finish_game",
+          "claim_stone",
+          "return_to_bridge",
+          "install_stone",
         ].includes(type)
       )
         packet.expectedTurn = turn;

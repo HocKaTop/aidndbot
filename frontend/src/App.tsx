@@ -12,7 +12,6 @@ import {
   BookOpen,
   Check,
   Copy,
-  Dices,
   Flame,
   Plus,
   Scroll,
@@ -24,14 +23,16 @@ import {
   Swords,
   Users,
   Trash2,
-  X,
 } from "lucide-react";
 import { api, setToken, ApiError } from "./api";
 import { useRoomSocket } from "./useRoomSocket";
+import { useRoomHistory } from "./useRoomHistory";
+import { EventJournal } from "./EventJournal";
+import { Toast } from "./Toast";
 import { DeleteRoomDialog } from "./DeleteRoomDialog";
 import { CampaignEnding, FinishCampaignDialog } from "./CampaignEnding";
 import { SettingsForm, HeroCard } from "./components";
-import type { GameEvent, Room, Settings, User } from "./types";
+import type { Room, Settings, User } from "./types";
 const defaults: Settings = {
   name: "",
   setting: "Тёмное фэнтези",
@@ -63,24 +64,33 @@ const labels: Record<string, string> = {
   PAUSED: "На паузе",
   FINISHED: "Завершена",
 };
+const attackAbilities = {
+  warrior: { id: "power_strike", label: "Мощный удар", cost: 1 },
+  rogue: { id: "precise_strike", label: "Точный удар", cost: 1 },
+  mage: { id: "firebolt", label: "Огненный снаряд", cost: 0 },
+};
+const defenseAbilities = {
+  warrior: { id: "guard", label: "Стойка стража" },
+  rogue: { id: "evade", label: "Уклонение" },
+  mage: { id: "barrier", label: "Магический барьер" },
+};
 export default function App() {
   const [user, setUser] = useState<User | null>(null),
     [rooms, setRooms] = useState<Room[]>([]),
-    [room, setRoom] = useState<Room | null>(null),
-    [events, setEvents] = useState<GameEvent[]>([]);
+    [room, setRoom] = useState<Room | null>(null);
+  const history = useRoomHistory(room?.id);
   const [screen, setScreen] = useState("home"),
     [tab, setTab] = useState("game"),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(true),
     [code, setCode] = useState(WebApp.initDataUnsafe.start_param || ""),
-    [dice, setDice] = useState("d20"),
     [notice, setNotice] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<Room | null>(null);
   const [finishTarget, setFinishTarget] = useState<string | null>(null);
+  const [hiddenDeliveryId, setHiddenDeliveryId] = useState<string | null>(null);
   const active = useRef<string | null>(null);
   const refreshSequence = useRef(0);
-  const bottom = useRef<HTMLDivElement>(null);
   const previousRoom = useRef<{ id: string; status: string } | null>(null);
   useEffect(() => {
     if (
@@ -92,6 +102,16 @@ export default function App() {
     }
     previousRoom.current = room ? { id: room.id, status: room.status } : null;
   }, [room?.id, room?.status]);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 4500);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  useEffect(() => {
+    if (!user || !error) return;
+    const timer = window.setTimeout(() => setError(""), 8000);
+    return () => window.clearTimeout(timer);
+  }, [error, user]);
   const run = async (fn: () => Promise<void>) => {
     setError("");
     setBusy(true);
@@ -136,7 +156,6 @@ export default function App() {
     active.current = null;
     refreshSequence.current++;
     setRoom(null);
-    setEvents([]);
     setDeleteTarget(null);
     setFinishTarget(null);
     setScreen("home");
@@ -150,14 +169,10 @@ export default function App() {
     const rid = active.current;
     if (!rid) return;
     const sequence = ++refreshSequence.current;
-    void Promise.all([
-      api<Room>("/rooms/" + rid),
-      api<GameEvent[]>("/rooms/" + rid + "/events"),
-    ])
-      .then(([r, e]) => {
+    void Promise.all([api<Room>("/rooms/" + rid), history.refresh(rid)])
+      .then(([r]) => {
         if (active.current === rid && sequence === refreshSequence.current) {
           setRoom(r);
-          setEvents(e);
         }
       })
       .catch((e) => {
@@ -167,7 +182,7 @@ export default function App() {
           removed("Комната удалена или больше недоступна");
         else setError(e.message);
       });
-  }, [removed]);
+  }, [removed, history.refresh]);
   const {
     status,
     processing,
@@ -187,14 +202,16 @@ export default function App() {
     room?.state.turn,
   );
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [events.length, processing]);
+    if (delivery?.status !== "completed") return;
+    const id = delivery.packet.id;
+    const timer = window.setTimeout(() => setHiddenDeliveryId(id), 3500);
+    return () => window.clearTimeout(timer);
+  }, [delivery?.packet.id, delivery?.status]);
   const open = (r: Room) => {
     active.current = r.id;
     setRoom(r);
     setScreen("room");
     setTab(r.status === "WAITING" ? "party" : "game");
-    setEvents([]);
     refresh();
   };
   const home = () => {
@@ -207,6 +224,39 @@ export default function App() {
   };
   const owner = !!room && room.ownerId === user?.id;
   const hero = room?.state.characters.find((h) => h.userId === user?.id);
+  const classAttack = hero?.classId ? attackAbilities[hero.classId] : undefined;
+  const classDefense = hero?.classId
+    ? defenseAbilities[hero.classId]
+    : undefined;
+  const presentNPCs =
+    room?.state.npcs.filter(
+      (npc) => npc.alive && npc.location === room.state.scene?.location,
+    ) ?? [];
+  const localHostile = presentNPCs.some((npc) => npc.disposition === "hostile");
+  const lantern =
+    room?.state.settings.name === "Последний фонарь" &&
+    room.state.settings.worldDescription.toLowerCase().includes("тихий брод") &&
+    room.state.settings.worldDescription
+      .toLowerCase()
+      .includes("огненный камень");
+  const place =
+    `${room?.state.scene?.title ?? ""} ${room?.state.scene?.location ?? ""}`.toLowerCase();
+  const myStone = hero?.inventory.find(
+    (item) =>
+      item.quantity > 0 && item.name.toLowerCase() === "огненный камень",
+  );
+  const partyHasStone = room?.state.characters.some((character) =>
+    character.inventory.some(
+      (item) =>
+        item.quantity > 0 && item.name.toLowerCase() === "огненный камень",
+    ),
+  );
+  const thiefReleasedStone = room?.state.npcs.some(
+    (npc) =>
+      npc.name.toLowerCase().includes("похит") &&
+      npc.location === room.state.scene?.location &&
+      (!npc.alive || npc.disposition === "friendly"),
+  );
   const waiting = room?.status === "WAITING";
   const combatHero = room?.state.combat
     ? room.state.characters.find(
@@ -254,6 +304,18 @@ export default function App() {
     if (!myTurn || processing || pending || room?.status !== "PLAYING") return;
     if (text.trim()) send("player_action", { text });
   };
+  const visibleDelivery =
+    screen === "room" &&
+    room &&
+    delivery &&
+    (delivery.status !== "completed" || delivery.packet.id !== hiddenDeliveryId)
+      ? delivery
+      : null;
+  const retryAvailable =
+    visibleDelivery &&
+    ["failed", "unknown"].includes(visibleDelivery.status) &&
+    (visibleDelivery.packet.type !== "player_action" ||
+      visibleDelivery.packet.data.text === text);
   if (loading)
     return (
       <main className="gate">
@@ -299,20 +361,60 @@ export default function App() {
           {user.firstName.slice(0, 1)}
         </div>
       </header>
-      {error && (
-        <div className="error banner" role="alert">
-          {error}
-          <button aria-label="Закрыть ошибку" onClick={() => setError("")}>
-            <X size={16} />
-          </button>
-        </div>
-      )}
-      {notice && (
-        <div className="notice banner" role="status">
-          {notice}
-          <button aria-label="Закрыть" onClick={() => setNotice("")}>
-            <X size={16} />
-          </button>
+      {(error || notice || visibleDelivery || (screen === "room" && processing && actor)) && (
+        <div className="toast-viewport" role="region" aria-label="Оповещения">
+          {error && (
+            <Toast tone="error" title={error} onClose={() => setError("")} />
+          )}
+          {notice && (
+            <Toast tone="success" title={notice} onClose={() => setNotice("")} />
+          )}
+          {visibleDelivery ? (
+            <Toast
+              tone={
+                ["failed", "unknown"].includes(visibleDelivery.status)
+                  ? "error"
+                  : visibleDelivery.status === "completed"
+                    ? "success"
+                    : "info"
+              }
+              title={
+                {
+                  sent: "Отправлено — ждём подтверждения",
+                  queued: "Принято сервером — ждём выполнения",
+                  processing: "Действие выполняется",
+                  unknown: "Результат пока не подтверждён",
+                  failed: "Действие не выполнено",
+                  completed: "Действие выполнено",
+                }[visibleDelivery.status]
+              }
+              action={
+                retryAvailable && (
+                  <button
+                    className="toast-retry"
+                    disabled={status !== "online" || processing}
+                    onClick={retry}
+                  >
+                    Повторить отправку
+                  </button>
+                )
+              }
+            >
+              {visibleDelivery.message && <p>{visibleDelivery.message}</p>}
+              {visibleDelivery.status === "unknown" && (
+                <p>
+                  Текст сохранён. После подключения проверим результат. Повторная
+                  отправка не создаст второй ход.
+                </p>
+              )}
+            </Toast>
+          ) : (
+            screen === "room" &&
+            processing &&
+            actor && (
+              <Toast tone="info" title={`Мастер обрабатывает действие: ${actor}`} />
+            )
+          )}
         </div>
       )}
       <main>
@@ -328,9 +430,9 @@ export default function App() {
                 <em>Измени судьбу.</em>
               </h1>
               <p>
-                Живой мир, общие решения и ведущий,
+                Задай свой мир — ведущий придумает историю,
                 <br />
-                который помнит ваши приключения.
+                а ты играй один или с друзьями.
               </p>
               <button
                 className="primary"
@@ -508,6 +610,48 @@ export default function App() {
                 Завершить приключение
               </button>
             )}
+            {["PLAYING", "PAUSED"].includes(room.status) &&
+              !room.state.combat &&
+              room.state.quests.length > 0 &&
+              room.state.quests.every((q) => q.status !== "ACTIVE") && (
+                <section className="panel stack" aria-label="Цели приключения">
+                  <h2>Активных целей больше нет</h2>
+                  <p>
+                    Выполнено квестов:{" "}
+                    {
+                      room.state.quests.filter((q) => q.status === "COMPLETED")
+                        .length
+                    }
+                    . Провалено:{" "}
+                    {
+                      room.state.quests.filter((q) => q.status === "FAILED")
+                        .length
+                    }
+                    .
+                  </p>
+                  <p>
+                    {owner
+                      ? "Если ваша история закончена, подведи итоги и сохрани финал. Можно также продолжить игру и найти новую цель."
+                      : "Обсудите финал с отрядом. Владелец может завершить приключение и сохранить итоги."}
+                  </p>
+                  {owner && !lantern && room.state.quests.filter((q) => q.status === "COMPLETED").map((q) => (
+                    <button key={q.id} className="secondary" disabled={busy || processing || pending || status !== "online"} onClick={() => send("reopen_quest", { target: q.id })}>
+                      Вернуть цель «{q.title}» в игру
+                    </button>
+                  ))}
+                  {owner && (
+                    <button
+                      className="primary"
+                      disabled={
+                        busy || processing || pending || status !== "online"
+                      }
+                      onClick={() => setFinishTarget(room.id)}
+                    >
+                      Подвести итоги
+                    </button>
+                  )}
+                </section>
+              )}
             {waiting && (
               <section className="panel stack" aria-label="Подготовка отряда">
                 <h2>
@@ -541,99 +685,6 @@ export default function App() {
                 {tab !== "party" && (
                   <button className="secondary" onClick={() => setTab("party")}>
                     Открыть отряд
-                  </button>
-                )}
-              </section>
-            )}
-            {processing && actor && (
-              <p className="notice banner" role="status">
-                Мастер обрабатывает действие: {actor}
-              </p>
-            )}
-            {delivery && (
-              <section className="panel stack" aria-label="Статус действия">
-                <p role="status">
-                  {
-                    {
-                      sent: "Отправлено — ждём подтверждения",
-                      queued: "Принято сервером — ждём выполнения",
-                      processing: "Действие выполняется",
-                      unknown: "Результат пока не подтверждён",
-                      failed: "Действие не выполнено",
-                      completed: "Действие выполнено",
-                    }[delivery.status]
-                  }
-                </p>
-                {delivery.message && <p>{delivery.message}</p>}
-                {delivery.status === "unknown" && (
-                  <p>
-                    Текст сохранён. После подключения проверим результат.
-                    Повторная отправка этого действия не создаст второй ход.
-                  </p>
-                )}
-                {["failed", "unknown"].includes(delivery.status) &&
-                  (delivery.packet.type !== "player_action" ||
-                    delivery.packet.data.text === text) && (
-                    <button
-                      className="secondary"
-                      disabled={status !== "online" || processing}
-                      onClick={retry}
-                    >
-                      Повторить отправку
-                    </button>
-                  )}
-              </section>
-            )}
-            {combatHero && (
-              <section className="panel stack" aria-label="Очередь боя">
-                <h2>
-                  Раунд {room.state.combatRound} · Ходит {combatHero.name}
-                </h2>
-                <p>
-                  {room.state.combatOrder
-                    ?.map(
-                      (id) =>
-                        room.state.characters.find(
-                          (h) => h.userId === id && h.hp > 0,
-                        )?.name,
-                    )
-                    .filter(Boolean)
-                    .join(" → ")}
-                </p>
-                <p>
-                  После каждого хода отвечает противник. При обрыве связи
-                  очередь сохраняется. Владелец может пропустить ход после
-                  минуты ожидания.
-                </p>
-                {myTurn && (
-                  <button
-                    className="secondary"
-                    disabled={
-                      processing ||
-                      pending ||
-                      status !== "online" ||
-                      room.status !== "PLAYING"
-                    }
-                    onClick={() => send("pass_turn", {})}
-                  >
-                    Пропустить мой ход
-                  </button>
-                )}
-                {owner && !myTurn && (
-                  <button
-                    className="secondary"
-                    disabled={
-                      processing ||
-                      pending ||
-                      status !== "online" ||
-                      room.status !== "PLAYING" ||
-                      skipWait !== 0
-                    }
-                    onClick={() => send("skip_turn", { turn: room.state.turn })}
-                  >
-                    {skipWait > 0
-                      ? `Ждём игрока · ${skipWait} с`
-                      : `Пропустить ход: ${combatHero.name}`}
                   </button>
                 )}
               </section>
@@ -680,20 +731,22 @@ export default function App() {
                       </div>
                     );
                   })}
-                  <button
-                    className="secondary full"
-                    onClick={() =>
-                      void run(async () => {
-                        await navigator.clipboard.writeText(
-                          room.inviteUrl || room.code,
-                        );
-                        setNotice("Приглашение скопировано");
-                      })
-                    }
-                  >
-                    <Copy size={16} />
-                    Пригласить друзей · {room.code}
-                  </button>
+                  {waiting && (
+                    <button
+                      className="secondary full"
+                      onClick={() =>
+                        void run(async () => {
+                          await navigator.clipboard.writeText(
+                            room.inviteUrl || room.code,
+                          );
+                          setNotice("Приглашение скопировано");
+                        })
+                      }
+                    >
+                      <Copy size={16} />
+                      Пригласить друзей · {room.code}
+                    </button>
+                  )}
                   <p>
                     Чтобы получать события в Telegram, напиши боту{" "}
                     <code>/room {room.code}</code>. Уведомления можно выключить
@@ -736,15 +789,15 @@ export default function App() {
                           Класс
                           <select name="class">
                             <option>Воин</option>
-                            <option>Следопыт</option>
-                            <option>Маг</option>
                             <option>Плут</option>
+                            <option>Маг</option>
                           </select>
                         </label>
                       </div>
                       <small>
-                        В MVP классы описывают образ героя; стартовые
-                        характеристики одинаковы.
+                        Воин: 24 HP, броня 15 и мощный удар. Плут: 18 HP, точный
+                        удар и уклонение. Маг: 16 HP, огненный снаряд и барьер.
+                        Расы пока описательные.
                       </small>
                       <button className="primary" disabled={busy}>
                         Создать персонажа
@@ -845,7 +898,7 @@ export default function App() {
                       .slice(0, 1)
                       .map((q) => (
                         <div key={q.id}>
-                          <div className="eyebrow">Ближайшая цель</div>
+                          <div className="eyebrow">Цель приключения</div>
                           <h3>{q.title}</h3>
                           <p>{q.description}</p>
                         </div>
@@ -864,47 +917,253 @@ export default function App() {
                     </p>
                   </section>
                 )}
-                <div className="journal">
-                  {events.map((e) => (
-                    <article
-                      key={e.id}
-                      className={
-                        "event " +
-                        (e.type === "GM_MESSAGE"
-                          ? "gm"
-                          : e.type === "PLAYER_ACTION"
-                            ? "player"
-                            : "mechanics")
-                      }
-                    >
-                      <div className="eyebrow">
-                        {e.type === "GM_MESSAGE" ? (
-                          <>
-                            <Sparkles size={13} />
-                            Ведущий
-                          </>
-                        ) : e.type === "PLAYER_ACTION" ? (
-                          "Действие игрока"
-                        ) : (
-                          <>
-                            <Dices size={13} />
-                            Правила мира
-                          </>
-                        )}
+                {room.status === "PLAYING" && room.state.pendingQuestCompletion && (
+                  <section className="panel stack" aria-label="Предложение завершить цель">
+                    <div className="eyebrow">Решение об итоге</div>
+                    <h2>Цель достигнута?</h2>
+                    <p>{room.state.pendingQuestCompletion.reason}</p>
+                    <p>Ведущий предлагает завершить цель. Пока она активна, история продолжается.</p>
+                    {owner ? (
+                      <div className="combat-actions">
+                        <button className="primary" disabled={processing || pending || status !== "online"} onClick={() => send("confirm_quest", {})}>
+                          Подтвердить{room.state.quests.filter((q) => q.status === "ACTIVE").length === 1 && room.state.quests.every((q) => q.status !== "FAILED") ? " и завершить" : ""}
+                        </button>
+                        <button className="secondary" disabled={processing || pending || status !== "online"} onClick={() => send("continue_quest", {})}>
+                          Продолжить историю
+                        </button>
                       </div>
-                      <p>{e.payload.text}</p>
-                    </article>
-                  ))}
-                  {processing && (
-                    <article className="event gm thinking">
-                      <Sparkles size={16} />
-                      {actor
-                        ? `Ведущий обдумывает действие: ${actor}…`
-                        : "Ведущий обдумывает ход…"}
-                    </article>
+                    ) : <p>Владелец кампании может подтвердить итог или продолжить историю.</p>}
+                  </section>
+                )}
+                {lantern &&
+                  room.status === "PLAYING" &&
+                  hero &&
+                  hero.hp > 0 &&
+                  !room.state.combat &&
+                  place.includes("мельн") &&
+                  thiefReleasedStone &&
+                  !partyHasStone && (
+                    <button
+                      className="primary full"
+                      disabled={
+                        processing || pending || !myTurn || status !== "online"
+                      }
+                      onClick={() => send("claim_stone", {})}
+                    >
+                      Забрать огненный камень
+                    </button>
                   )}
-                  <div ref={bottom} />
-                </div>
+                {lantern &&
+                  room.status === "PLAYING" &&
+                  hero &&
+                  hero.hp > 0 &&
+                  myStone &&
+                  !room.state.combat &&
+                  !localHostile &&
+                  !place.includes("мост") &&
+                  !place.includes("фонар") && (
+                    <button
+                      className="primary full"
+                      disabled={
+                        processing || pending || !myTurn || status !== "online"
+                      }
+                      onClick={() => send("return_to_bridge", {})}
+                    >
+                      Вернуться с камнем к мосту
+                    </button>
+                  )}
+                {lantern &&
+                  room.status === "PLAYING" &&
+                  hero &&
+                  hero.hp > 0 &&
+                  myStone &&
+                  !room.state.combat &&
+                  !localHostile &&
+                  (place.includes("мост") || place.includes("фонар")) && (
+                    <button
+                      className="primary full"
+                      disabled={
+                        processing || pending || !myTurn || status !== "online"
+                      }
+                      onClick={() => send("install_stone", {})}
+                    >
+                      Установить камень и завершить приключение
+                    </button>
+                  )}
+                <EventJournal
+                  key={room.id}
+                  history={history}
+                />
+                {combatHero && (
+                  <section className="panel stack" aria-label="Очередь боя">
+                    <h2>
+                      Раунд {room.state.combatRound} · Ходит {combatHero.name}
+                    </h2>
+                    <p>
+                      {room.state.combatOrder
+                        ?.map(
+                          (id) =>
+                            room.state.characters.find(
+                              (h) => h.userId === id && h.hp > 0,
+                            )?.name,
+                        )
+                        .filter(Boolean)
+                        .join(" → ")}
+                    </p>
+                    <p>
+                      После каждого хода отвечает один противник; несколько
+                      врагов чередуются. При обрыве связи очередь сохраняется.
+                      Владелец может пропустить ход после минуты ожидания.
+                    </p>
+                    {myTurn && (
+                      <div className="combat-actions">
+                        {classDefense && hero && (
+                          <button
+                            className="secondary"
+                            disabled={
+                              processing ||
+                              pending ||
+                              status !== "online" ||
+                              room.status !== "PLAYING" ||
+                              (hero.resource ?? 0) < 1
+                            }
+                            onClick={() =>
+                              send("class_ability", {
+                                ability: classDefense.id,
+                              })
+                            }
+                          >
+                            {classDefense.label} · +4 AC · 1 ресурс
+                          </button>
+                        )}
+                        <button
+                          className="secondary"
+                          disabled={
+                            processing ||
+                            pending ||
+                            status !== "online" ||
+                            room.status !== "PLAYING"
+                          }
+                          onClick={() => send("defend_turn", {})}
+                        >
+                          Защищаться · +2 AC
+                        </button>
+                        <button
+                          className="secondary"
+                          disabled={
+                            processing ||
+                            pending ||
+                            status !== "online" ||
+                            room.status !== "PLAYING"
+                          }
+                          onClick={() => send("pass_turn", {})}
+                        >
+                          Пропустить мой ход
+                        </button>
+                      </div>
+                    )}
+                    {owner && !myTurn && (
+                      <button
+                        className="secondary"
+                        disabled={
+                          processing ||
+                          pending ||
+                          status !== "online" ||
+                          room.status !== "PLAYING" ||
+                          skipWait !== 0
+                        }
+                        onClick={() =>
+                          send("skip_turn", { turn: room.state.turn })
+                        }
+                      >
+                        {skipWait > 0
+                          ? `Ждём игрока · ${skipWait} с`
+                          : `Пропустить ход: ${combatHero.name}`}
+                      </button>
+                    )}
+                  </section>
+                )}
+                {room.status === "PLAYING" &&
+                  hero &&
+                  hero.hp > 0 &&
+                  presentNPCs.length > 0 && (
+                    <section
+                      className="panel stack"
+                      aria-label="Боевые действия"
+                    >
+                      <h2>Персонажи рядом</h2>
+                      {presentNPCs.map((npc) => (
+                        <div className="combat-target" key={npc.id}>
+                          <strong>
+                            {npc.name} · {npc.hp}/{npc.maxHp} HP
+                          </strong>
+                          <div className="combat-actions">
+                            <button
+                              className="secondary"
+                              disabled={
+                                processing ||
+                                pending ||
+                                !myTurn ||
+                                status !== "online"
+                              }
+                              onClick={() =>
+                                send("attack_npc", { target: npc.id })
+                              }
+                            >
+                              Атаковать {npc.name}
+                            </button>
+                            {classAttack && (
+                              <button
+                                className="secondary"
+                                disabled={
+                                  processing ||
+                                  pending ||
+                                  !myTurn ||
+                                  status !== "online" ||
+                                  (room.state.combat &&
+                                    (hero.resource ?? 0) < classAttack.cost)
+                                }
+                                onClick={() =>
+                                  send("class_ability", {
+                                    ability: classAttack.id,
+                                    target: npc.id,
+                                  })
+                                }
+                              >
+                                {classAttack.label}
+                                {classAttack.cost > 0 ? " · 1 ресурс" : ""}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                      {room.state.combat &&
+                        hero.hp < hero.maxHp &&
+                        hero.inventory
+                          .filter(
+                            (item) =>
+                              item.type === "HEALING" && item.quantity > 0,
+                          )
+                          .slice(0, 1)
+                          .map((item) => (
+                            <button
+                              key={item.id}
+                              className="secondary"
+                              disabled={
+                                processing ||
+                                pending ||
+                                !myTurn ||
+                                status !== "online"
+                              }
+                              onClick={() =>
+                                send("use_item", { itemId: item.id })
+                              }
+                            >
+                              Выпить зелье · {item.quantity} шт.
+                            </button>
+                          ))}
+                    </section>
+                  )}
                 {room.status !== "FINISHED" && (
                   <form className="composer" onSubmit={action}>
                     {room.status === "PLAYING" &&
@@ -945,31 +1204,6 @@ export default function App() {
                       }
                     />
                     <div className="inline">
-                      <select
-                        aria-label="Кубик"
-                        value={dice}
-                        onChange={(e) => setDice(e.target.value)}
-                      >
-                        <option>d20</option>
-                        <option>d6</option>
-                        <option>2d6+3</option>
-                        <option>1d8-1</option>
-                      </select>
-                      <button
-                        type="button"
-                        aria-label="Бросить кубик"
-                        disabled={
-                          processing ||
-                          pending ||
-                          status !== "online" ||
-                          room.status !== "PLAYING" ||
-                          !hero ||
-                          hero.hp <= 0
-                        }
-                        onClick={() => send("roll_dice", { notation: dice })}
-                      >
-                        <Dices size={20} />
-                      </button>
                       <button
                         className="primary"
                         aria-label="Отправить действие"
@@ -1082,6 +1316,22 @@ export default function App() {
                               ? "Дружественный"
                               : "Нейтральный"}
                         </small>
+                        {room.status === "PLAYING" &&
+                          n.alive &&
+                          n.location === room.state.scene?.location &&
+                          hero &&
+                          hero.hp > 0 && (
+                            <button
+                              type="button"
+                              className="secondary"
+                              disabled={processing || pending || !myTurn}
+                              onClick={() =>
+                                send("attack_npc", { target: n.id })
+                              }
+                            >
+                              <Swords size={16} /> Атаковать
+                            </button>
+                          )}
                       </div>
                     ))
                   ) : (

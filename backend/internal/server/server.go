@@ -106,6 +106,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/api/rooms/{id}/characters/me", s.myCharacter)
 		r.Get("/api/rooms/{id}/quests", s.quests)
 		r.Get("/api/rooms/{id}/events", s.events)
+		r.Get("/api/rooms/{id}/events/page", s.eventPage)
 		r.Post("/api/rooms/{id}/start", s.start)
 		r.Post("/api/rooms/{id}/pause", s.pause)
 	})

@@ -251,6 +251,20 @@ main {
   flex-direction: column;
   gap: 18px;
 }
+.combat-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.combat-actions button {
+  flex: 1 1 160px;
+}
+.combat-target {
+  display: grid;
+  gap: 10px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
 .room-card {
   text-align: left;
   width: 100%;
@@ -327,7 +341,7 @@ select {
   background: #11170f66;
   color: inherit;
   padding: 12px 14px;
-  font-size: 14px;
+  font-size: 16px;
   outline: none;
 }
 textarea {
@@ -445,6 +459,12 @@ details .stack {
   border-radius: 12px;
   border: 1px solid var(--line);
 }
+.journal-latest {
+  position: sticky;
+  top: 12px;
+  z-index: 2;
+  background: var(--panel);
+}
 .event p {
   margin-top: 9px;
   color: inherit;
@@ -472,12 +492,6 @@ details .stack {
   font-size: 12px;
   color: var(--muted);
 }
-.thinking {
-  display: flex;
-  gap: 10px;
-  color: var(--accent);
-  font-size: 13px;
-}
 .composer {
   background: var(--panel);
   border: 1px solid #c5d59630;
@@ -493,11 +507,6 @@ details .stack {
 }
 .composer .inline {
   justify-content: flex-end;
-}
-.composer select {
-  width: 110px;
-  margin-right: auto;
-  padding: 10px;
 }
 .composer .primary {
   padding: 12px;
@@ -617,29 +626,98 @@ nav button.selected {
   color: var(--accent);
   background: #c5d5960a;
 }
-.banner {
-  margin: 16px 24px 0;
-  padding: 13px 14px;
-  border-radius: 9px;
-  font-size: 13px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-  overflow-wrap: anywhere;
-}
-.banner button {
-  padding: 4px;
-  background: transparent;
-  border: 0;
-}
 .error {
   color: #efb0a5;
   background: #4b242450;
 }
-.notice {
-  color: var(--accent);
-  background: #c5d59615;
+.toast-viewport {
+  position: fixed;
+  top: calc(
+    82px +
+      var(--tg-content-safe-area-inset-top, env(safe-area-inset-top, 0px))
+  );
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  width: min(440px, calc(100% - 24px));
+  display: grid;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  --toast-color: #a6b9ce;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--toast-color);
+  border-radius: 12px;
+  background: var(--tg-theme-secondary-bg-color, #202821);
+  color: var(--tg-theme-text-color, #e4e7dd);
+  box-shadow: 0 12px 36px #0008;
+  pointer-events: auto;
+  overflow-wrap: anywhere;
+  animation: toast-in 0.18s ease-out;
+}
+.toast-success {
+  --toast-color: var(--accent);
+}
+.toast-error {
+  --toast-color: #efb0a5;
+}
+.toast-icon {
+  color: var(--toast-color);
+  margin-top: 1px;
+}
+.toast-content {
+  min-width: 0;
+}
+.toast-content strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+.toast-detail {
+  margin-top: 5px;
+  max-height: 22dvh;
+  overflow-y: auto;
+}
+.toast-detail p {
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.toast-detail p + p {
+  margin-top: 6px;
+}
+.toast-action {
+  margin-top: 9px;
+}
+.toast-retry {
+  padding: 7px 10px;
+  background: transparent;
+  border-color: var(--toast-color);
+  color: inherit;
+  font-size: 12px;
+}
+.toast-close {
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 .gate {
   max-width: 560px;

@@ -234,7 +234,7 @@ func (b *Bot) response(chatID int64, text string) reply {
 	out := reply{ChatID: chatID, Text: text}
 	u, err := url.Parse(b.AppURL)
 	if err == nil && u.Scheme == "https" && u.Host != "" {
-		out.ReplyMarkup = &keyboard{Rows: [][]button{{{Text: "Открыть Nocturna", WebApp: webapp{URL: b.AppURL}}}}}
+		out.ReplyMarkup = &keyboard{Rows: [][]button{{{Text: "Открыть мини-приложение", WebApp: webapp{URL: b.AppURL}}}}}
 	}
 	return out
 }

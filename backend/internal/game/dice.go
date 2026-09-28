@@ -8,7 +8,11 @@ import (
 	"strconv"
 )
 
-var notation = regexp.MustCompile(`^(\d{0,2})d(\d{1,4})([+-]\d{1,3})?$`)
+// DiceNotationPattern is shared with structured AI output. Preserve the
+// parser's padded forms (01d0006+003), as well as its numeric and width limits.
+const DiceNotationPattern = `^(0?[1-9]|1[0-9]|20)?d(0{0,3}[2-9]|0{0,2}[1-9][0-9]|0?[1-9][0-9]{2}|1000)([+-](0{0,2}[0-9]|0?[1-9][0-9]|100))?$`
+
+var notation = regexp.MustCompile(DiceNotationPattern)
 
 type Dice struct {
 	Count    int

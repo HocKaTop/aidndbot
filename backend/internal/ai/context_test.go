@@ -42,4 +42,13 @@ func TestDefaultContextFitsPartyAndNarration(t *testing.T) {
 	if _, err := prepareInput(in, DefaultContextWindow); err != nil {
 		t.Fatal("ordinary multiplayer narration exceeds default budget", err)
 	}
+	in.Results = nil
+	if _, err := prepareInput(in, DefaultContextWindow); err != nil {
+		t.Fatal("ordinary multiplayer planning exceeds default budget", err)
+	}
+	in.State.Quests = []game.Quest{{ID: "goal", Title: "Вернуть сигнал", Description: "Добраться до передатчика.", Status: "ACTIVE"}}
+	in.State.Turn = 8
+	if _, err := prepareInput(in, DefaultContextWindow); err != nil {
+		t.Fatal("paced multiplayer planning exceeds default budget", err)
+	}
 }

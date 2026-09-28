@@ -24,6 +24,10 @@ UPDATE room_members SET ready=$3 WHERE room_id=$1 AND user_id=$2;
 INSERT INTO game_events(id,room_id,actor_id,type,payload) VALUES($1,$2,$3,$4,$5);
 -- name: ListEvents :many
 SELECT * FROM (SELECT * FROM game_events WHERE room_id=$1 ORDER BY sequence DESC LIMIT 100) recent ORDER BY sequence;
+-- name: EarlierEvents :many
+SELECT * FROM game_events WHERE room_id=$1 AND (sqlc.narg(before_sequence)::bigint IS NULL OR sequence < sqlc.narg(before_sequence)::bigint) ORDER BY sequence DESC LIMIT $2;
+-- name: LaterEvents :many
+SELECT * FROM game_events WHERE room_id=$1 AND sequence > $2 ORDER BY sequence LIMIT $3;
 -- name: SaveCharacter :exec
 INSERT INTO characters(id,room_id,user_id,data) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data;
 -- name: DeleteCharacter :exec

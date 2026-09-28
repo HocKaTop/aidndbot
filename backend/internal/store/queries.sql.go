@@ -104,6 +104,44 @@ func (q *Queries) DeleteRoom(ctx context.Context, id pgtype.UUID) error {
 	return err
 }
 
+const earlierEvents = `-- name: EarlierEvents :many
+SELECT id, room_id, actor_id, type, payload, created_at, sequence FROM game_events WHERE room_id=$1 AND ($3::bigint IS NULL OR sequence < $3::bigint) ORDER BY sequence DESC LIMIT $2
+`
+
+type EarlierEventsParams struct {
+	RoomID         pgtype.UUID `json:"room_id"`
+	Limit          int32       `json:"limit"`
+	BeforeSequence pgtype.Int8 `json:"before_sequence"`
+}
+
+func (q *Queries) EarlierEvents(ctx context.Context, arg EarlierEventsParams) ([]GameEvent, error) {
+	rows, err := q.db.Query(ctx, earlierEvents, arg.RoomID, arg.Limit, arg.BeforeSequence)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GameEvent{}
+	for rows.Next() {
+		var i GameEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RoomID,
+			&i.ActorID,
+			&i.Type,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.Sequence,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const findRoom = `-- name: FindRoom :one
 SELECT id, code, owner_id, name, status, state, created_at, updated_at FROM rooms WHERE code=$1
 `
@@ -170,6 +208,44 @@ func (q *Queries) GetRoom(ctx context.Context, id pgtype.UUID) (Room, error) {
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const laterEvents = `-- name: LaterEvents :many
+SELECT id, room_id, actor_id, type, payload, created_at, sequence FROM game_events WHERE room_id=$1 AND sequence > $2 ORDER BY sequence LIMIT $3
+`
+
+type LaterEventsParams struct {
+	RoomID   pgtype.UUID `json:"room_id"`
+	Sequence int64       `json:"sequence"`
+	Limit    int32       `json:"limit"`
+}
+
+func (q *Queries) LaterEvents(ctx context.Context, arg LaterEventsParams) ([]GameEvent, error) {
+	rows, err := q.db.Query(ctx, laterEvents, arg.RoomID, arg.Sequence, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GameEvent{}
+	for rows.Next() {
+		var i GameEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RoomID,
+			&i.ActorID,
+			&i.Type,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.Sequence,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listEvents = `-- name: ListEvents :many

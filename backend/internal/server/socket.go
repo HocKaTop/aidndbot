@@ -27,6 +27,8 @@ type Command struct {
 		Text     string `json:"text,omitempty"`
 		Notation string `json:"notation,omitempty"`
 		ItemID   string `json:"itemId,omitempty"`
+		Ability  string `json:"ability,omitempty"`
+		Target   string `json:"target,omitempty"`
 		Ready    bool   `json:"ready,omitempty"`
 		Turn     int    `json:"turn,omitempty"`
 		Code     string `json:"code,omitempty"`
@@ -262,7 +264,7 @@ func (s *Server) socket(w http.ResponseWriter, r *http.Request) {
 		}
 		last = time.Now()
 		switch cmd.Type {
-		case "player_action", "roll_dice", "use_item", "ready", "start_game", "pass_turn", "skip_turn", "finish_game":
+		case "player_action", "attack_npc", "roll_dice", "use_item", "class_ability", "ready", "start_game", "pass_turn", "defend_turn", "skip_turn", "finish_game", "claim_stone", "return_to_bridge", "install_stone", "confirm_quest", "continue_quest", "reopen_quest":
 		default:
 			s.Hub.replyCommand(c, cmd, "failed", "Неизвестное событие")
 			continue

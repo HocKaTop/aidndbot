@@ -24,10 +24,19 @@ const textHelp = `Можно играть прямо здесь, без Mini App
 /state — сцена, отряд, HP и инвентарь
 /history — последние события
 /pass — пропустить свой ход в бою
+/defend — защищаться в бою (+2 AC против ответной атаки)
+/power, /guard — умения воина; /precise, /evade — умения плута
+/firebolt, /barrier — умения мага; после атакующего умения можно указать имя цели
 /skip — пропустить задержавшегося игрока после минуты (владелец)
 /mute и /unmute — выключить или включить уведомления выбранной кампании
 /roll d20 — бросить кубик
 /use 1 — использовать предмет по номеру из /state
+/claim — забрать огненный камень у побеждённого или договорившегося похитителя
+/bridge — вернуться с камнем к мосту
+/install — установить камень в фонарь у моста и завершить «Последний фонарь»
+/confirm — подтвердить предложенное ведущим завершение цели (владелец)
+/continue — отклонить предложение и продолжить цель (владелец)
+/reopen — вернуть ошибочно завершённую цель в игру (владелец)
 /pause — поставить игру на паузу
 /finish — завершить кампанию и сохранить итоги (владелец, с подтверждением)
 /delete — удалить выбранную комнату (владелец, с подтверждением)
@@ -78,12 +87,15 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		if arg == "" {
 			arg = "Ночная таверна"
 		}
-		hero := game.NewCharacter(user.ID, user.FirstName, "Человек", "Воин")
+		hero, err := game.NewClassCharacter(user.ID, user.FirstName, "Человек", "Воин")
+		if err != nil {
+			return "", err
+		}
 		room, err := s.createCampaign(ctx, user.ID, game.Settings{Name: arg, Setting: "Тёмное фэнтези", Tone: "Таинственный", WorldDescription: "После долгой дороги герои оказываются у заброшенной таверны. Начни с исследования, без внезапного боя.", Rules: "Упрощённая fantasy RPG", Difficulty: "Обычная", GMStyle: "Предлагай понятный выбор, отвечай кратко по-русски", MaxPlayers: 6}, &hero)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Кампания «%s» создана. Герой %s создан: 20 HP.\n\nКод для друзей: %s\nОни могут написать боту /join %s\n\nКаждый игрок должен отправить /ready, затем владелец — /play. Можно играть одному.", room.State.Settings.Name, hero.Name, room.Code, room.Code), nil
+		return fmt.Sprintf("Кампания «%s» создана. Герой %s создан: %d HP.\n\nКод для друзей: %s\nОни могут написать боту /join %s\n\nКаждый игрок должен отправить /ready, затем владелец — /play. Можно играть одному.", room.State.Settings.Name, hero.Name, hero.HP, room.Code, room.Code), nil
 	case "/rooms":
 		rows, err := q.ListRooms(ctx, user.ID)
 		if err != nil {
@@ -122,7 +134,11 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 					}
 				}
 				if r.State.Hero(user.ID) == nil && r.Status == "WAITING" {
-					r.State.Characters = append(r.State.Characters, game.NewCharacter(user.ID, user.FirstName, "Человек", "Воин"))
+					hero, e := game.NewClassCharacter(user.ID, user.FirstName, "Человек", "Воин")
+					if e != nil {
+						return e
+					}
+					r.State.Characters = append(r.State.Characters, hero)
 				}
 				return q.SelectBotRoom(ctx, store.SelectBotRoomParams{UserID: user.ID, RoomID: raw.ID})
 			})
@@ -142,7 +158,7 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 	}
 	if isCommand {
 		switch command {
-		case "/play", "/pause", "/finish", "/state", "/history", "/roll", "/use", "/delete", "/ready", "/unready", "/pass", "/skip", "/mute", "/unmute":
+		case "/play", "/pause", "/finish", "/state", "/history", "/roll", "/use", "/claim", "/bridge", "/install", "/confirm", "/continue", "/reopen", "/delete", "/ready", "/unready", "/pass", "/defend", "/power", "/guard", "/precise", "/evade", "/firebolt", "/barrier", "/skip", "/mute", "/unmute":
 		default:
 			return "Неизвестная команда. /help — список команд.", nil
 		}
@@ -252,8 +268,49 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 	cmd := Command{Type: "player_action"}
 	cmd.Data.Text = text
 	switch command {
+	case "/confirm":
+		cmd.Type = "confirm_quest"
+	case "/continue":
+		cmd.Type = "continue_quest"
+	case "/reopen":
+		cmd.Type = "reopen_quest"
+		for _, quest := range room.State.Quests {
+			if quest.Status == "COMPLETED" && (arg == "" || strings.EqualFold(quest.Title, arg)) {
+				if cmd.Data.Target != "" {
+					return "Укажи название цели: /reopen Название цели", nil
+				}
+				cmd.Data.Target = quest.ID
+			}
+		}
+		if cmd.Data.Target == "" {
+			return "Завершённая цель не найдена. Посмотри /state.", nil
+		}
+	case "/claim":
+		cmd.Type = "claim_stone"
+	case "/bridge":
+		cmd.Type = "return_to_bridge"
+	case "/install":
+		cmd.Type = "install_stone"
 	case "/pass":
 		cmd.Type = "pass_turn"
+	case "/defend":
+		cmd.Type = "defend_turn"
+	case "/power", "/guard", "/precise", "/evade", "/firebolt", "/barrier":
+		abilities := map[string]string{"/power": "power_strike", "/guard": "guard", "/precise": "precise_strike", "/evade": "evade", "/firebolt": "firebolt", "/barrier": "barrier"}
+		cmd.Type = "class_ability"
+		cmd.Data.Ability = abilities[command]
+		if command == "/power" || command == "/precise" || command == "/firebolt" {
+			matches := []game.NPC{}
+			for _, npc := range room.State.NPCs {
+				if npc.Alive && room.State.Present(npc) && (arg == "" || strings.EqualFold(npc.Name, arg)) {
+					matches = append(matches, npc)
+				}
+			}
+			if len(matches) != 1 {
+				return "Укажи точное имя одной цели в текущей сцене, например: /firebolt Похититель.", nil
+			}
+			cmd.Data.Target = matches[0].ID
+		}
 	case "/skip":
 		cmd.Type = "skip_turn"
 		cmd.Data.Turn = room.State.Turn
@@ -301,14 +358,18 @@ func describeRoom(r Room, user int64) string {
 		fmt.Fprintf(&out, "\nМастер обрабатывает действие: %s.\n", r.Activity.Name)
 	}
 	if h := r.State.CombatHero(); h != nil {
-		fmt.Fprintf(&out, "\nРаунд %d. Сейчас ходит %s. /pass — пропустить свой ход. Владелец может использовать /skip после минуты ожидания.\n", r.State.CombatRound, h.Name)
+		fmt.Fprintf(&out, "\nРаунд %d. Сейчас ходит %s. /defend — защита, /pass — пропустить свой ход. Владелец может использовать /skip после минуты ожидания.\n", r.State.CombatRound, h.Name)
 	}
 	if r.State.Scene != nil {
 		fmt.Fprintf(&out, "\n%s\n%s\n", r.State.Scene.Title, r.State.Scene.Description)
 	}
 	out.WriteString("\nОтряд:\n")
 	for _, h := range r.State.Characters {
-		fmt.Fprintf(&out, "%s: %d/%d HP\n", h.Name, h.HP, h.MaxHP)
+		fmt.Fprintf(&out, "%s · %s · уровень %d: %d/%d HP, %d опыта", h.Name, h.Class, h.Level, h.HP, h.MaxHP, h.Experience)
+		if h.ClassID != "" {
+			fmt.Fprintf(&out, ", ресурс %d/%d", h.Resource, h.ResourceMax)
+		}
+		out.WriteByte('\n')
 	}
 	if r.Status == "WAITING" {
 		if err := lobbyReady(&r); err != nil {
@@ -328,6 +389,9 @@ func describeRoom(r Room, user int64) string {
 		for _, v := range r.State.Quests {
 			fmt.Fprintf(&out, "%s · %s\n", v.Title, v.Status)
 		}
+	}
+	if proposal := r.State.PendingQuestCompletion; proposal != nil {
+		fmt.Fprintf(&out, "\nВедущий предлагает завершить цель: %s\nВладелец: /confirm — подтвердить, /continue — продолжить.\n", proposal.Reason)
 	}
 	return out.String()
 }

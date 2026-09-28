@@ -70,6 +70,7 @@ func (s *Server) openAdventure(ctx context.Context, q *store.Queries, room *Room
 	if err != nil {
 		return err
 	}
+	rememberGMNotes(&room.State, out.Memory)
 	room.Status = "PLAYING"
 	if err = s.addEvent(ctx, q, room.ID, user, "GAME_STARTED", game.Result{Type: "GAME_STARTED", Text: "Отряд готов. Приключение начинается."}); err != nil {
 		return err

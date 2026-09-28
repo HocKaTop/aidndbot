@@ -34,6 +34,16 @@ type Room struct {
 	Members   []Member   `json:"members"`
 	InviteURL string     `json:"inviteUrl"`
 }
+
+// GM notes persist with the room but must never be included in player-facing
+// room responses. The AI receives them through its separate world-state input.
+func (r Room) MarshalJSON() ([]byte, error) {
+	public := r
+	public.State.GMNotes = nil
+	type roomJSON Room
+	return json.Marshal(roomJSON(public))
+}
+
 type Event struct {
 	ID        string          `json:"id"`
 	Type      string          `json:"type"`
@@ -457,6 +467,11 @@ func (s *Server) character(w http.ResponseWriter, r *http.Request) {
 		fail(w, bad("Проверь имя, расу и класс"))
 		return
 	}
+	hero, err := game.NewClassCharacter(uid(r), in.Name, in.Race, in.Class)
+	if err != nil {
+		fail(w, bad(err.Error()))
+		return
+	}
 	rid := chi.URLParam(r, "id")
 	_, e := s.mutate(r.Context(), rid, uid(r), false, func(q *store.Queries, room *Room) error {
 		if room.Status != "WAITING" {
@@ -465,7 +480,7 @@ func (s *Server) character(w http.ResponseWriter, r *http.Request) {
 		if room.State.Hero(uid(r)) != nil {
 			return bad("Персонаж уже создан")
 		}
-		room.State.Characters = append(room.State.Characters, game.NewCharacter(uid(r), in.Name, in.Race, in.Class))
+		room.State.Characters = append(room.State.Characters, hero)
 		return nil
 	})
 	s.finish(w, r, rid, e, "character_updated")
@@ -616,7 +631,7 @@ func (s *Server) editCharacter(w http.ResponseWriter, r *http.Request) {
 		if hero == nil || hero.ID != key(hid) {
 			return bad("Персонаж не найден")
 		}
-		for target, value := range map[*string]*string{&hero.Name: in.Name, &hero.Race: in.Race, &hero.Class: in.Class} {
+		for target, value := range map[*string]*string{&hero.Name: in.Name, &hero.Race: in.Race} {
 			if value != nil {
 				v := strings.TrimSpace(*value)
 				if v == "" || utf8.RuneCountInString(v) > 40 {
@@ -624,6 +639,15 @@ func (s *Server) editCharacter(w http.ResponseWriter, r *http.Request) {
 				}
 				*target = v
 			}
+		}
+		if in.Class != nil {
+			class := strings.TrimSpace(*in.Class)
+			updated, e := game.NewClassCharacter(uid(r), hero.Name, hero.Race, class)
+			if e != nil {
+				return bad(e.Error())
+			}
+			updated.ID = hero.ID
+			*hero = updated
 		}
 		return nil
 	})

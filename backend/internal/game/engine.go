@@ -17,11 +17,13 @@ type Action struct {
 	Status      string `json:"status,omitempty"`
 }
 type Result struct {
-	Type    string        `json:"type"`
-	Text    string        `json:"text"`
-	Roll    *Roll         `json:"roll,omitempty"`
-	Attack  *AttackResult `json:"attack,omitempty"`
-	Success *bool         `json:"success,omitempty"`
+	Type       string        `json:"type"`
+	Text       string        `json:"text"`
+	Roll       *Roll         `json:"roll,omitempty"`
+	Attack     *AttackResult `json:"attack,omitempty"`
+	Success    *bool         `json:"success,omitempty"`
+	ArmorBonus int           `json:"armorBonus,omitempty"`
+	Status     string        `json:"status,omitempty"`
 }
 
 func ValidateAction(s *State, user int64, a Action) error {
@@ -56,6 +58,11 @@ func ValidateAction(s *State, user int64, a Action) error {
 		if s.NPC(a.Target) == nil {
 			return errors.New("NPC не найден")
 		}
+	case "SET_DISPOSITION":
+		n := s.NPC(a.Target)
+		if n == nil || !n.Alive || !s.Present(*n) || (a.Status != "hostile" && a.Status != "neutral" && a.Status != "friendly") {
+			return errors.New("недоступный NPC или некорректное отношение")
+		}
 	case "MOVE_SCENE":
 		if s.Combat || strings.TrimSpace(a.Name) == "" {
 			return errors.New("переход сейчас невозможен")
@@ -65,6 +72,9 @@ func ValidateAction(s *State, user int64, a Action) error {
 			return errors.New("некорректный квест")
 		}
 	case "UPDATE_QUEST":
+		if !s.Settings.LastLantern() && a.Status == "COMPLETED" {
+			return errors.New("цель пользовательской кампании требует подтверждения игроков")
+		}
 		found := false
 		for _, q := range s.Quests {
 			if q.ID == a.Target && q.Status == "ACTIVE" {
@@ -73,6 +83,29 @@ func ValidateAction(s *State, user int64, a Action) error {
 		}
 		if !found || (a.Status != "COMPLETED" && a.Status != "FAILED") {
 			return errors.New("некорректное обновление квеста")
+		}
+	case "PROPOSE_QUEST_COMPLETION":
+		if s.Settings.LastLantern() || s.Combat || s.HasEnemies() || s.PendingQuestCompletion != nil || strings.TrimSpace(a.Description) == "" {
+			return errors.New("предложение завершить цель сейчас недоступно")
+		}
+		found := false
+		for _, q := range s.Quests {
+			found = found || q.ID == a.Target && q.Status == "ACTIVE"
+		}
+		if !found {
+			return errors.New("активная цель не найдена")
+		}
+	case "FINISH_CAMPAIGN":
+		if !s.Settings.LastLantern() {
+			return errors.New("финал пользовательской кампании требует подтверждения игроков")
+		}
+		if hero := s.Hero(user); hero == nil || hero.HP <= 0 || s.Combat || s.HasEnemies() || len(s.Quests) == 0 {
+			return errors.New("завершить кампанию сейчас нельзя: есть бой, противники или нет выполненной цели")
+		}
+		for _, quest := range s.Quests {
+			if quest.Status != "COMPLETED" {
+				return errors.New("завершить кампанию можно после выполнения всех целей")
+			}
 		}
 	case "START_COMBAT":
 		if !s.HasEnemies() || s.Combat {
@@ -123,11 +156,18 @@ func Apply(s *State, user int64, a Action) (Result, error) {
 		for _, item := range h.Inventory {
 			if item.Type == "WEAPON" && item.Quantity > 0 {
 				sides = 8
+				if h.ClassID == "rogue" || h.ClassID == "mage" {
+					sides = 6
+				}
 				break
 			}
 		}
-		modifier := Modifier(h.Stats.Strength)
-		r, e := Attack(n.Name, n.HP, n.ArmorClass, modifier+2, fmt.Sprintf("1d%d%+d", sides, modifier))
+		ability := h.Stats.Strength
+		if h.ClassID == "rogue" {
+			ability = h.Stats.Dexterity
+		}
+		modifier := Modifier(ability)
+		r, e := Attack(n.Name, n.HP, n.ArmorClass, modifier+Proficiency(h.Level), fmt.Sprintf("1d%d%+d", sides, modifier))
 		if e != nil {
 			return out, e
 		}
@@ -165,21 +205,37 @@ func Apply(s *State, user int64, a Action) (Result, error) {
 	case "UPDATE_NPC":
 		s.NPC(a.Target).Description = a.Description
 		out.Text = "Обновлено описание NPC"
+	case "SET_DISPOSITION":
+		n := s.NPC(a.Target)
+		n.Disposition = a.Status
+		labels := map[string]string{"hostile": "враждебное", "neutral": "нейтральное", "friendly": "дружелюбное"}
+		out.Text = "Отношение " + n.Name + ": " + labels[a.Status]
 	case "MOVE_SCENE":
 		s.Scene = &Scene{uuid.NewString(), a.Name, a.Description, a.Name}
 		out.Text = "Новая сцена: " + a.Name
 	case "CREATE_QUEST":
-		s.Quests = append(s.Quests, Quest{uuid.NewString(), a.Name, a.Description, "ACTIVE"})
+		s.Quests = append(s.Quests, Quest{ID: uuid.NewString(), Title: a.Name, Description: a.Description, Status: "ACTIVE"})
 		out.Text = "Новый квест: " + a.Name
 	case "UPDATE_QUEST":
 		for i := range s.Quests {
 			if s.Quests[i].ID == a.Target {
 				s.Quests[i].Status = a.Status
+				out.Status = a.Status
 				out.Text = "Квест: " + s.Quests[i].Title + " — " + a.Status
 			}
 		}
+	case "PROPOSE_QUEST_COMPLETION":
+		s.PendingQuestCompletion = &QuestCompletionProposal{QuestID: a.Target, Reason: strings.TrimSpace(a.Description)}
+		out.Text = "Ведущий предлагает завершить цель: " + s.PendingQuestCompletion.Reason
+	case "FINISH_CAMPAIGN":
+		out.Text = "Все цели выполнены. Приключение завершено."
 	case "START_COMBAT":
 		s.Combat = true
+		for i := range s.Characters {
+			if s.Characters[i].ClassID != "" {
+				s.Characters[i].Resource = s.Characters[i].ResourceMax
+			}
+		}
 		out.Text = "Бой начался"
 	case "END_COMBAT":
 		s.Combat = false
@@ -228,24 +284,31 @@ func UseItem(s *State, user int64, id string) (Result, error) {
 	return Result{}, errors.New("лечебное зелье не найдено")
 }
 
-// Enemies retaliate once per player action; all numbers are server-owned.
-func Retaliate(s *State, user int64) ([]Result, error) {
+// One living enemy retaliates per player action. Enemies take turns in scene
+// order, so a second enemy can never remain permanently passive.
+func Retaliate(s *State, user int64, armorBonus int) ([]Result, error) {
 	out := []Result{}
 	h := s.Hero(user)
 	if !s.Combat || h == nil {
 		return out, nil
 	}
+	enemies := make([]NPC, 0, len(s.NPCs))
 	for _, n := range s.NPCs {
-		if n.Alive && n.Disposition == "hostile" && s.Present(n) && h.HP > 0 {
-			r, e := Attack(h.Name, h.HP, h.ArmorClass, 2, "1d4+1")
-			if e != nil {
-				return nil, e
-			}
-			h.HP = r.TargetHP
-			out = append(out, Result{Type: "NPC_ATTACK", Text: fmt.Sprintf("%s атакует %s: урон %d, HP %d", n.Name, h.Name, r.Damage, h.HP), Attack: &r})
-			break
+		if n.Alive && n.Disposition == "hostile" && s.Present(n) {
+			enemies = append(enemies, n)
 		}
 	}
+	if len(enemies) == 0 || h.HP <= 0 {
+		return out, nil
+	}
+	n := enemies[s.NPCResponseCount%len(enemies)]
+	r, e := Attack(h.Name, h.HP, h.ArmorClass+armorBonus, 2, "1d4+1")
+	if e != nil {
+		return nil, e
+	}
+	h.HP = r.TargetHP
+	s.NPCResponseCount++
+	out = append(out, Result{Type: "NPC_ATTACK", Text: fmt.Sprintf("%s атакует %s: урон %d, HP %d", n.Name, h.Name, r.Damage, h.HP), Attack: &r})
 	return out, nil
 }
 
@@ -257,6 +320,9 @@ func validateActionOrder(actions []Action) error {
 	}
 	mechanical := 0
 	for i, a := range actions {
+		if a.Type == "FINISH_CAMPAIGN" && i != len(actions)-1 {
+			return errors.New("завершение кампании должно быть последним действием хода")
+		}
 		switch a.Type {
 		case "ATTACK", "SKILL_CHECK", "DICE_ROLL":
 			mechanical++
@@ -278,7 +344,69 @@ func ValidateActions(state *State, user int64, actions []Action) error {
 		return err
 	}
 	projected := state.Clone()
+	objectiveStone := ""
+	if state.Settings.LastLantern() {
+		if hero := state.Hero(user); hero != nil {
+			for _, item := range hero.Inventory {
+				if item.Quantity > 0 && isLanternStone(item.Name) {
+					objectiveStone = item.ID
+					break
+				}
+			}
+		}
+	}
+	removedStone := false
 	for i, a := range actions {
+		if state.Settings.LastLantern() {
+			if a.Type == "UPDATE_QUEST" && a.Status == "FAILED" && len(state.Quests) > 0 && a.Target == state.Quests[0].ID {
+				return errors.New("неудачный разговор или проверка не проваливают главную цель; предложи другой подход")
+			}
+			if a.Type == "ADD_ITEM" && strings.Contains(strings.ToLower(a.Name), "кам") && !isLanternStone(a.Name) {
+				return errors.New("назови найденный предмет точно «Огненный камень», чтобы отряд мог установить его в фонарь")
+			}
+			if a.Type == "ADD_ITEM" && isLanternStone(a.Name) {
+				if projected.Scene == nil || !strings.Contains(strings.ToLower(projected.Scene.Title+" "+projected.Scene.Location), "мельн") {
+					return errors.New("огненный камень находится у похитителя на мельнице, его нельзя получить в другой сцене")
+				}
+				released := false
+				for _, n := range projected.NPCs {
+					if strings.Contains(strings.ToLower(n.Name), "похит") && projected.Present(n) && (!n.Alive || n.Disposition == "friendly") {
+						released = true
+					}
+				}
+				if !released {
+					return errors.New("сначала договорись с похитителем или победи его; камень ещё недоступен")
+				}
+				for _, hero := range projected.Characters {
+					for _, item := range hero.Inventory {
+						if item.Quantity > 0 && isLanternStone(item.Name) {
+							return errors.New("огненный камень уже у отряда; не выдавай второй")
+						}
+					}
+				}
+			}
+			if a.Type == "REMOVE_ITEM" && a.Target == objectiveStone {
+				removedStone = true
+			}
+			if a.Type == "UPDATE_QUEST" && a.Status == "COMPLETED" && len(state.Quests) > 0 && a.Target == state.Quests[0].ID {
+				if !removedStone || !atLanternBridge(projected.Scene) || projected.Combat || projected.HasEnemies() {
+					return errors.New("сначала получи огненный камень, вернись к мосту и установи его действием REMOVE_ITEM перед завершением цели")
+				}
+				for _, hero := range projected.Characters {
+					for _, item := range hero.Inventory {
+						if item.Quantity > 0 && isLanternStone(item.Name) {
+							return errors.New("у отряда ещё есть огненный камень; установка не завершена")
+						}
+					}
+				}
+			}
+		}
+		if a.Type == "SET_DISPOSITION" && state.Combat && a.Status != "hostile" {
+			n := state.NPC(a.Target)
+			if n != nil && n.Disposition == "hostile" && (i == 0 || actions[0].Type != "SKILL_CHECK" || actions[0].Skill != "charisma") {
+				return errors.New("для примирения с противником в бою сначала нужна проверка charisma")
+			}
+		}
 		if err := ValidateAction(&projected, user, a); err != nil {
 			return fmt.Errorf("действие %d (%s): %w", i+1, a.Type, err)
 		}
@@ -292,6 +420,18 @@ func ValidateActions(state *State, user int64, actions []Action) error {
 		}
 	}
 	return nil
+}
+
+func isLanternStone(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "Огненный камень")
+}
+
+func atLanternBridge(scene *Scene) bool {
+	if scene == nil {
+		return false
+	}
+	place := strings.ToLower(scene.Title + " " + scene.Location)
+	return strings.Contains(place, "мост") || strings.Contains(place, "фонар")
 }
 
 func ApplyActions(s *State, user int64, actions []Action) ([]Result, error) {

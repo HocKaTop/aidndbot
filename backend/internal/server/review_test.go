@@ -267,6 +267,7 @@ func TestTurnRulesAndRollback(t *testing.T) {
 	}
 	before := string(blob(saved.State))
 	eventCount := len(events)
+	cmd.Data.Text = "Иду в соседнюю комнату"
 	for _, failNarration := range []bool{false, true} {
 		model.actions = []game.Action{{Type: "MOVE_SCENE", Name: "Changed", Description: "New scene"}}
 		model.failNarration = failNarration
