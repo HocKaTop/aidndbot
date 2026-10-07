@@ -6,6 +6,7 @@ import (
 	"dnd-bot/backend/internal/store"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -67,6 +68,28 @@ func (s *Server) room(ctx context.Context, q *store.Queries, raw store.Room) (Ro
 	}
 	if e := json.Unmarshal(raw.State, &out.State); e != nil {
 		return out, e
+	}
+	if proposal := out.State.PendingQuestCompletion; proposal != nil && proposal.ID == "" {
+		// Give pre-ID proposals a stable identity across reads until the room is saved.
+		proposal.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(proposal.QuestID+"\x00"+proposal.Reason+"\x00"+fmt.Sprint(out.State.Turn))).String()
+	}
+	if len(out.State.Locations) == 0 {
+		// Rooms saved before persistent locations still have their scene history
+		// in the scenes table. Load it once, then persist it with the next turn.
+		if out.State.Scene != nil {
+			out.State.RememberLocation(*out.State.Scene)
+		}
+		past, err := q.ListScenes(ctx, raw.ID)
+		if err != nil {
+			return out, err
+		}
+		for _, data := range past {
+			var scene game.Scene
+			if err := json.Unmarshal(data, &scene); err != nil {
+				return out, err
+			}
+			out.State.RememberLocation(scene)
+		}
 	}
 	out.State.EnsureCombatOrder(0, raw.UpdatedAt.Time)
 	ms, e := q.ListMembers(ctx, raw.ID)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"strings"
+	"unicode"
 )
 
 type Action struct {
@@ -15,8 +16,10 @@ type Action struct {
 	Skill       string `json:"skill,omitempty"`
 	DC          int    `json:"dc,omitempty"`
 	Status      string `json:"status,omitempty"`
+	Threat      string `json:"threat,omitempty"`
 }
 type Result struct {
+	Item       *Item         `json:"item,omitempty"`
 	Type       string        `json:"type"`
 	Text       string        `json:"text"`
 	Roll       *Roll         `json:"roll,omitempty"`
@@ -24,6 +27,38 @@ type Result struct {
 	Success    *bool         `json:"success,omitempty"`
 	ArmorBonus int           `json:"armorBonus,omitempty"`
 	Status     string        `json:"status,omitempty"`
+}
+
+func npcNameAlias(a, b string) bool {
+	words := func(name string) string {
+		parts := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		})
+		return " " + strings.Join(parts, " ") + " "
+	}
+	left, right := words(a), words(b)
+	return strings.TrimSpace(left) != "" && strings.TrimSpace(right) != "" && (strings.Contains(left, right) || strings.Contains(right, left))
+}
+
+func linkLocations(s *State, from, to string) {
+	if from == to {
+		return
+	}
+	for _, edge := range [][2]string{{from, to}, {to, from}} {
+		place := s.Location(edge[0])
+		if place != nil {
+			found := false
+			for _, id := range place.Exits {
+				found = found || id == edge[1]
+			}
+			if !found {
+				place.Exits = append(place.Exits, edge[1])
+			}
+			if s.Scene != nil && s.Scene.ID == place.ID {
+				s.Scene.Exits = append([]string(nil), place.Exits...)
+			}
+		}
+	}
 }
 
 func ValidateAction(s *State, user int64, a Action) error {
@@ -51,29 +86,60 @@ func ValidateAction(s *State, user int64, a Action) error {
 			return errors.New("некорректная сложность")
 		}
 	case "CREATE_NPC":
+		if a.Threat != "" && a.Threat != "minor" && a.Threat != "standard" && a.Threat != "elite" {
+			return errors.New("неизвестный уровень угрозы NPC")
+		}
 		if strings.TrimSpace(a.Name) == "" || len(s.NPCs) >= 30 || (a.Status != "hostile" && a.Status != "friendly" && a.Status != "neutral") {
 			return errors.New("некорректный NPC")
+		}
+		if s.Settings.LastLantern() && strings.EqualFold(strings.TrimSpace(a.Name), "Огненный камень") {
+			return errors.New("огненный камень — предмет: используй ADD_ITEM, а не CREATE_NPC")
+		}
+		for _, npc := range s.NPCs {
+			if npcNameAlias(npc.Name, a.Name) {
+				return errors.New("NPC с таким именем уже существует: перемести его через MOVE_NPC, а не создавай заново")
+			}
 		}
 	case "UPDATE_NPC":
 		if s.NPC(a.Target) == nil {
 			return errors.New("NPC не найден")
+		}
+	case "MOVE_NPC":
+		if s.NPC(a.Target) == nil || s.ResolveLocation(a.Name) == nil {
+			return errors.New("NPC или место назначения не найдены")
 		}
 	case "SET_DISPOSITION":
 		n := s.NPC(a.Target)
 		if n == nil || !n.Alive || !s.Present(*n) || (a.Status != "hostile" && a.Status != "neutral" && a.Status != "friendly") {
 			return errors.New("недоступный NPC или некорректное отношение")
 		}
-	case "MOVE_SCENE":
-		if s.Combat || strings.TrimSpace(a.Name) == "" {
+	case "MOVE_SCENE", "CREATE_LOCATION":
+		if a.Type == "MOVE_SCENE" && s.Combat || strings.TrimSpace(a.Name) == "" {
 			return errors.New("переход сейчас невозможен")
+		}
+		for _, place := range s.Locations {
+			if strings.EqualFold(strings.TrimSpace(place.Title), strings.TrimSpace(a.Name)) {
+				return errors.New("место уже существует; используй REVISIT_SCENE с его ID")
+			}
+		}
+	case "REVISIT_SCENE":
+		if s.Combat || s.Location(a.Target) == nil || (s.Scene != nil && s.Scene.ID == a.Target) {
+			return errors.New("возвращение в это место сейчас невозможно")
+		}
+	case "RECORD_LOCATION_FACT":
+		if s.Scene == nil || len(s.Scene.Facts) >= 20 || strings.TrimSpace(a.Description) == "" || len(a.Description) > 300 {
+			return errors.New("факт локации недоступен")
 		}
 	case "CREATE_QUEST":
 		if strings.TrimSpace(a.Name) == "" || len(s.Quests) >= 30 {
 			return errors.New("некорректный квест")
 		}
+		if s.Settings.LastLantern() && len(s.Quests) > 0 {
+			return errors.New("в Последнем фонаре одна цель: продолжай возвращение камня, не создавай новый квест")
+		}
 	case "UPDATE_QUEST":
-		if !s.Settings.LastLantern() && a.Status == "COMPLETED" {
-			return errors.New("цель пользовательской кампании требует подтверждения игроков")
+		if !s.Settings.LastLantern() {
+			return errors.New("исход цели пользовательской кампании требует подтверждения игроков")
 		}
 		found := false
 		for _, q := range s.Quests {
@@ -84,7 +150,7 @@ func ValidateAction(s *State, user int64, a Action) error {
 		if !found || (a.Status != "COMPLETED" && a.Status != "FAILED") {
 			return errors.New("некорректное обновление квеста")
 		}
-	case "PROPOSE_QUEST_COMPLETION":
+	case "PROPOSE_QUEST_COMPLETION", "PROPOSE_QUEST_FAILURE":
 		if s.Settings.LastLantern() || s.Combat || s.HasEnemies() || s.PendingQuestCompletion != nil || strings.TrimSpace(a.Description) == "" {
 			return errors.New("предложение завершить цель сейчас недоступно")
 		}
@@ -197,22 +263,67 @@ func Apply(s *State, user int64, a Action) (Result, error) {
 		out.Text = fmt.Sprintf("%s = %d", a.Name, r.Total)
 	case "CREATE_NPC":
 		location := ""
+		locationID := ""
 		if s.Scene != nil {
 			location = s.Scene.Location
+			locationID = s.Scene.ID
 		}
-		s.NPCs = append(s.NPCs, NPC{uuid.NewString(), a.Name, a.Description, 12, 12, 12, true, a.Status, location})
+		profile := NPCProfile(a.Threat)
+		s.NPCs = append(s.NPCs, NPC{ID: uuid.NewString(), Name: a.Name, Description: a.Description, HP: profile.HP, MaxHP: profile.HP, ArmorClass: profile.AC, Alive: true, Disposition: a.Status, Location: location, LocationID: locationID, Threat: a.Threat})
 		out.Text = "Появился NPC: " + a.Name
 	case "UPDATE_NPC":
 		s.NPC(a.Target).Description = a.Description
 		out.Text = "Обновлено описание NPC"
+	case "MOVE_NPC":
+		place := s.ResolveLocation(a.Name)
+		npc := s.NPC(a.Target)
+		npc.Location, npc.LocationID = place.Location, place.ID
+		out.Text = npc.Name + " переместился: " + place.Title
+	case "CREATE_LOCATION":
+		place := Scene{ID: uuid.NewString(), Title: a.Name, Description: a.Description, Location: a.Name}
+		s.RememberLocation(place)
+		if s.Scene != nil {
+			linkLocations(s, s.Scene.ID, place.ID)
+		}
+		out.Text = "Открыто место: " + place.Title
 	case "SET_DISPOSITION":
 		n := s.NPC(a.Target)
 		n.Disposition = a.Status
 		labels := map[string]string{"hostile": "враждебное", "neutral": "нейтральное", "friendly": "дружелюбное"}
 		out.Text = "Отношение " + n.Name + ": " + labels[a.Status]
 	case "MOVE_SCENE":
-		s.Scene = &Scene{uuid.NewString(), a.Name, a.Description, a.Name}
+		if s.Scene != nil {
+			s.RememberLocation(*s.Scene)
+		}
+		from := s.Scene
+		s.Scene = &Scene{ID: uuid.NewString(), Title: a.Name, Description: a.Description, Location: a.Name}
+		s.RememberLocation(*s.Scene)
+		if from != nil {
+			linkLocations(s, from.ID, s.Scene.ID)
+		}
 		out.Text = "Новая сцена: " + a.Name
+	case "REVISIT_SCENE":
+		if s.Scene != nil {
+			s.RememberLocation(*s.Scene)
+			linkLocations(s, s.Scene.ID, a.Target)
+		}
+		place := *s.Location(a.Target)
+		s.Scene = &place
+		out.Text = "Возвращение: " + place.Title
+	case "RECORD_LOCATION_FACT":
+		fact := strings.TrimSpace(a.Description)
+		for _, known := range s.Scene.Facts {
+			if strings.EqualFold(known, fact) {
+				out.Text = "Факт места уже известен"
+				return out, nil
+			}
+		}
+		s.Scene.Facts = append(s.Scene.Facts, fact)
+		s.RememberLocation(*s.Scene)
+		if known := s.Location(s.Scene.ID); known != nil {
+			known.Facts = append([]string(nil), s.Scene.Facts...)
+		}
+		out.Text = "Новое сведение о месте: " + fact
 	case "CREATE_QUEST":
 		s.Quests = append(s.Quests, Quest{ID: uuid.NewString(), Title: a.Name, Description: a.Description, Status: "ACTIVE"})
 		out.Text = "Новый квест: " + a.Name
@@ -224,9 +335,13 @@ func Apply(s *State, user int64, a Action) (Result, error) {
 				out.Text = "Квест: " + s.Quests[i].Title + " — " + a.Status
 			}
 		}
-	case "PROPOSE_QUEST_COMPLETION":
-		s.PendingQuestCompletion = &QuestCompletionProposal{QuestID: a.Target, Reason: strings.TrimSpace(a.Description)}
-		out.Text = "Ведущий предлагает завершить цель: " + s.PendingQuestCompletion.Reason
+	case "PROPOSE_QUEST_COMPLETION", "PROPOSE_QUEST_FAILURE":
+		status := "COMPLETED"
+		if a.Type == "PROPOSE_QUEST_FAILURE" {
+			status = "FAILED"
+		}
+		s.PendingQuestCompletion = &QuestCompletionProposal{ID: uuid.NewString(), QuestID: a.Target, Reason: strings.TrimSpace(a.Description), Status: status}
+		out.Text = "Ведущий предлагает исход цели: " + s.PendingQuestCompletion.Reason
 	case "FINISH_CAMPAIGN":
 		out.Text = "Все цели выполнены. Приключение завершено."
 	case "START_COMBAT":
@@ -243,11 +358,16 @@ func Apply(s *State, user int64, a Action) (Result, error) {
 	case "ADD_ITEM":
 		h := s.Hero(user)
 		h.Inventory = append(h.Inventory, Item{uuid.NewString(), a.Name, a.Description, 1, "QUEST"})
+		item := h.Inventory[len(h.Inventory)-1]
+		out.Item = &item
 		out.Text = "Получен предмет: " + a.Name
 	case "REMOVE_ITEM":
 		h := s.Hero(user)
 		for i, it := range h.Inventory {
 			if it.ID == a.Target {
+				item := it
+				item.Quantity = 1
+				out.Item = &item
 				h.Inventory[i].Quantity--
 				if h.Inventory[i].Quantity <= 0 {
 					h.Inventory = append(h.Inventory[:i], h.Inventory[i+1:]...)
@@ -302,7 +422,8 @@ func Retaliate(s *State, user int64, armorBonus int) ([]Result, error) {
 		return out, nil
 	}
 	n := enemies[s.NPCResponseCount%len(enemies)]
-	r, e := Attack(h.Name, h.HP, h.ArmorClass+armorBonus, 2, "1d4+1")
+	profile := NPCProfile(n.Threat)
+	r, e := Attack(h.Name, h.HP, h.ArmorClass+armorBonus, profile.AttackBonus, profile.Damage)
 	if e != nil {
 		return nil, e
 	}

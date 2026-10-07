@@ -53,6 +53,39 @@ const quickAdventure: Settings = {
   gmStyle:
     "Короткие сцены, понятная цель и выбор для новичков. Не решай за игроков.",
 };
+
+function SkipTurnButton({
+  since,
+  turn,
+  name,
+  disabled,
+  onSkip,
+}: {
+  since?: string;
+  turn: number;
+  name: string;
+  disabled: boolean;
+  onSkip: (turn: number) => void;
+}) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const deadline = Date.parse(since ?? "");
+  const wait = Number.isFinite(deadline)
+    ? Math.max(0, Math.ceil((deadline + 60000 - now) / 1000))
+    : 60;
+  return (
+    <button
+      className="secondary"
+      disabled={disabled || wait > 0}
+      onClick={() => onSkip(turn)}
+    >
+      {wait > 0 ? `Ждём игрока · ${wait} с` : `Пропустить ход: ${name}`}
+    </button>
+  );
+}
 const actionExamples = [
   "Я осматриваюсь и ищу, что поможет нам достичь цели.",
   "Я внимательно прислушиваюсь: что происходит рядом?",
@@ -228,10 +261,12 @@ export default function App() {
   const classDefense = hero?.classId
     ? defenseAbilities[hero.classId]
     : undefined;
+  const npcPresent = (npc: Room["state"]["npcs"][number]) =>
+    npc.locationId && room?.state.scene?.id
+      ? npc.locationId === room.state.scene.id
+      : npc.location === room?.state.scene?.location;
   const presentNPCs =
-    room?.state.npcs.filter(
-      (npc) => npc.alive && npc.location === room.state.scene?.location,
-    ) ?? [];
+    room?.state.npcs.filter((npc) => npc.alive && npcPresent(npc)) ?? [];
   const localHostile = presentNPCs.some((npc) => npc.disposition === "hostile");
   const lantern =
     room?.state.settings.name === "Последний фонарь" &&
@@ -254,7 +289,7 @@ export default function App() {
   const thiefReleasedStone = room?.state.npcs.some(
     (npc) =>
       npc.name.toLowerCase().includes("похит") &&
-      npc.location === room.state.scene?.location &&
+      npcPresent(npc) &&
       (!npc.alive || npc.disposition === "friendly"),
   );
   const waiting = room?.status === "WAITING";
@@ -265,18 +300,6 @@ export default function App() {
       )
     : undefined;
   const myTurn = !combatHero || combatHero.userId === user?.id;
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    if (!room?.state.combat) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [room?.state.combat]);
-  const skipWait = Math.max(
-    0,
-    Math.ceil(
-      (Date.parse(room?.state.combatTurnSince ?? "") + 60000 - now) / 1000,
-    ),
-  );
   const pendingMembers =
     room?.members.filter(
       (m) =>
@@ -361,13 +384,20 @@ export default function App() {
           {user.firstName.slice(0, 1)}
         </div>
       </header>
-      {(error || notice || visibleDelivery || (screen === "room" && processing && actor)) && (
+      {(error ||
+        notice ||
+        visibleDelivery ||
+        (screen === "room" && processing && actor)) && (
         <div className="toast-viewport" role="region" aria-label="Оповещения">
           {error && (
             <Toast tone="error" title={error} onClose={() => setError("")} />
           )}
           {notice && (
-            <Toast tone="success" title={notice} onClose={() => setNotice("")} />
+            <Toast
+              tone="success"
+              title={notice}
+              onClose={() => setNotice("")}
+            />
           )}
           {visibleDelivery ? (
             <Toast
@@ -403,8 +433,8 @@ export default function App() {
               {visibleDelivery.message && <p>{visibleDelivery.message}</p>}
               {visibleDelivery.status === "unknown" && (
                 <p>
-                  Текст сохранён. После подключения проверим результат. Повторная
-                  отправка не создаст второй ход.
+                  Текст сохранён. После подключения проверим результат.
+                  Повторная отправка не создаст второй ход.
                 </p>
               )}
             </Toast>
@@ -412,7 +442,10 @@ export default function App() {
             screen === "room" &&
             processing &&
             actor && (
-              <Toast tone="info" title={`Мастер обрабатывает действие: ${actor}`} />
+              <Toast
+                tone="info"
+                title={`Мастер обрабатывает действие: ${actor}`}
+              />
             )
           )}
         </div>
@@ -431,8 +464,7 @@ export default function App() {
               </h1>
               <p>
                 Задай свой мир — ведущий придумает историю,
-                <br />
-                а ты играй один или с друзьями.
+                <br />а ты играй один или с друзьями.
               </p>
               <button
                 className="primary"
@@ -634,11 +666,6 @@ export default function App() {
                       ? "Если ваша история закончена, подведи итоги и сохрани финал. Можно также продолжить игру и найти новую цель."
                       : "Обсудите финал с отрядом. Владелец может завершить приключение и сохранить итоги."}
                   </p>
-                  {owner && !lantern && room.state.quests.filter((q) => q.status === "COMPLETED").map((q) => (
-                    <button key={q.id} className="secondary" disabled={busy || processing || pending || status !== "online"} onClick={() => send("reopen_quest", { target: q.id })}>
-                      Вернуть цель «{q.title}» в игру
-                    </button>
-                  ))}
                   {owner && (
                     <button
                       className="primary"
@@ -895,7 +922,6 @@ export default function App() {
                     <p>{room.state.scene.description}</p>
                     {room.state.quests
                       .filter((q) => q.status === "ACTIVE")
-                      .slice(0, 1)
                       .map((q) => (
                         <div key={q.id}>
                           <div className="eyebrow">Цель приключения</div>
@@ -903,6 +929,41 @@ export default function App() {
                           <p>{q.description}</p>
                         </div>
                       ))}
+                    {owner &&
+                      !lantern &&
+                      room.status === "PLAYING" &&
+                      room.state.quests.some(
+                        (q) =>
+                          q.status === "COMPLETED" || q.status === "FAILED",
+                      ) && (
+                        <details>
+                          <summary>Исправить итог цели</summary>
+                          {room.state.quests
+                            .filter(
+                              (q) =>
+                                q.status === "COMPLETED" ||
+                                q.status === "FAILED",
+                            )
+                            .map((q) => (
+                              <button
+                                key={q.id}
+                                type="button"
+                                className="secondary"
+                                disabled={
+                                  busy ||
+                                  processing ||
+                                  pending ||
+                                  status !== "online"
+                                }
+                                onClick={() =>
+                                  send("reopen_quest", { target: q.id })
+                                }
+                              >
+                                Вернуть цель «{q.title}» в игру
+                              </button>
+                            ))}
+                        </details>
+                      )}
                   </section>
                 ) : (
                   <section className="empty">
@@ -917,24 +978,72 @@ export default function App() {
                     </p>
                   </section>
                 )}
-                {room.status === "PLAYING" && room.state.pendingQuestCompletion && (
-                  <section className="panel stack" aria-label="Предложение завершить цель">
-                    <div className="eyebrow">Решение об итоге</div>
-                    <h2>Цель достигнута?</h2>
-                    <p>{room.state.pendingQuestCompletion.reason}</p>
-                    <p>Ведущий предлагает завершить цель. Пока она активна, история продолжается.</p>
-                    {owner ? (
-                      <div className="combat-actions">
-                        <button className="primary" disabled={processing || pending || status !== "online"} onClick={() => send("confirm_quest", {})}>
-                          Подтвердить{room.state.quests.filter((q) => q.status === "ACTIVE").length === 1 && room.state.quests.every((q) => q.status !== "FAILED") ? " и завершить" : ""}
-                        </button>
-                        <button className="secondary" disabled={processing || pending || status !== "online"} onClick={() => send("continue_quest", {})}>
-                          Продолжить историю
-                        </button>
-                      </div>
-                    ) : <p>Владелец кампании может подтвердить итог или продолжить историю.</p>}
-                  </section>
-                )}
+                {room.status === "PLAYING" &&
+                  room.state.pendingQuestCompletion && (
+                    <section
+                      className="panel stack"
+                      aria-label="Предложение завершить цель"
+                    >
+                      <div className="eyebrow">Решение об итоге</div>
+                      <h2>
+                        {room.state.pendingQuestCompletion.status === "FAILED"
+                          ? "Цель провалена?"
+                          : "Цель достигнута?"}
+                      </h2>
+                      <p>{room.state.pendingQuestCompletion.reason}</p>
+                      <p>
+                        Ведущий предлагает исход цели. Пока она активна, история
+                        продолжается.
+                      </p>
+                      {owner ? (
+                        <div className="combat-actions">
+                          <button
+                            className="primary"
+                            disabled={
+                              processing || pending || status !== "online"
+                            }
+                            onClick={() =>
+                              send("confirm_quest", {
+                                proposalId:
+                                  room.state.pendingQuestCompletion!.id,
+                              })
+                            }
+                          >
+                            Подтвердить
+                            {room.state.pendingQuestCompletion.status !==
+                              "FAILED" &&
+                            room.state.quests.filter(
+                              (q) => q.status === "ACTIVE",
+                            ).length === 1 &&
+                            room.state.quests.every(
+                              (q) => q.status !== "FAILED",
+                            )
+                              ? " и завершить"
+                              : ""}
+                          </button>
+                          <button
+                            className="secondary"
+                            disabled={
+                              processing || pending || status !== "online"
+                            }
+                            onClick={() =>
+                              send("continue_quest", {
+                                proposalId:
+                                  room.state.pendingQuestCompletion!.id,
+                              })
+                            }
+                          >
+                            Продолжить историю
+                          </button>
+                        </div>
+                      ) : (
+                        <p>
+                          Владелец кампании может подтвердить итог или
+                          продолжить историю.
+                        </p>
+                      )}
+                    </section>
+                  )}
                 {lantern &&
                   room.status === "PLAYING" &&
                   hero &&
@@ -990,10 +1099,7 @@ export default function App() {
                       Установить камень и завершить приключение
                     </button>
                   )}
-                <EventJournal
-                  key={room.id}
-                  history={history}
-                />
+                <EventJournal key={room.id} history={history} />
                 {combatHero && (
                   <section className="panel stack" aria-label="Очередь боя">
                     <h2>
@@ -1060,26 +1166,39 @@ export default function App() {
                         >
                           Пропустить мой ход
                         </button>
+                        {room.state.scene?.exits?.map((id) => (
+                          <button
+                            key={id}
+                            className="secondary"
+                            disabled={
+                              processing ||
+                              pending ||
+                              status !== "online" ||
+                              room.status !== "PLAYING"
+                            }
+                            onClick={() => send("retreat", { target: id })}
+                          >
+                            Отступить:{" "}
+                            {room.state.locations?.find(
+                              (place) => place.id === id,
+                            )?.title ?? "известный выход"}
+                          </button>
+                        ))}
                       </div>
                     )}
                     {owner && !myTurn && (
-                      <button
-                        className="secondary"
+                      <SkipTurnButton
+                        since={room.state.combatTurnSince}
+                        turn={room.state.turn}
+                        name={combatHero.name}
                         disabled={
                           processing ||
                           pending ||
                           status !== "online" ||
-                          room.status !== "PLAYING" ||
-                          skipWait !== 0
+                          room.status !== "PLAYING"
                         }
-                        onClick={() =>
-                          send("skip_turn", { turn: room.state.turn })
-                        }
-                      >
-                        {skipWait > 0
-                          ? `Ждём игрока · ${skipWait} с`
-                          : `Пропустить ход: ${combatHero.name}`}
-                      </button>
+                        onSkip={(turn) => send("skip_turn", { turn })}
+                      />
                     )}
                   </section>
                 )}
@@ -1164,8 +1283,75 @@ export default function App() {
                           ))}
                     </section>
                   )}
+                {room.status === "PLAYING" &&
+                  hero &&
+                  hero.hp > 0 &&
+                  hero.inventory.some(
+                    (item) => item.type === "HEALING" && item.quantity > 0,
+                  ) &&
+                  room.state.characters.some(
+                    (ally) => ally.id !== hero.id && ally.hp <= 0,
+                  ) && (
+                    <section
+                      className="panel stack"
+                      aria-label="Помощь союзнику"
+                    >
+                      <h2>Помочь союзнику</h2>
+                      {room.state.characters
+                        .filter((ally) => ally.id !== hero.id && ally.hp <= 0)
+                        .map((ally) => (
+                          <button
+                            key={ally.id}
+                            className="secondary"
+                            disabled={
+                              processing ||
+                              pending ||
+                              !myTurn ||
+                              status !== "online"
+                            }
+                            onClick={() =>
+                              send("aid_ally", { target: ally.id })
+                            }
+                          >
+                            Передать зелье: {ally.name}
+                          </button>
+                        ))}
+                    </section>
+                  )}
+                {room.status === "PLAYING" &&
+                  hero &&
+                  hero.hp > 0 &&
+                  hero.hp < hero.maxHp &&
+                  !room.state.combat &&
+                  !localHostile &&
+                  room.state.scene?.id &&
+                  hero.lastRestLocationId !== room.state.scene.id &&
+                  !hero.restedLocationIds?.includes(room.state.scene.id) && (
+                    <button
+                      className="secondary full"
+                      disabled={processing || pending || status !== "online"}
+                      onClick={() => send("short_rest", {})}
+                    >
+                      Отдохнуть здесь · восстановить здоровье
+                    </button>
+                  )}
                 {room.status !== "FINISHED" && (
                   <form className="composer" onSubmit={action}>
+                    {room.state.scene && (
+                      <div className="composer-context">
+                        <strong>Сейчас: {room.state.scene.title}</strong>
+                        {room.state.quests
+                          .filter((q) => q.status === "ACTIVE")
+                          .map((q) => (
+                            <span key={q.id}>Цель: {q.title}</span>
+                          ))}
+                        {room.state.scene.facts?.at(-1) && (
+                          <span>
+                            Известно здесь: {room.state.scene.facts.at(-1)}
+                          </span>
+                        )}
+                      </div>
+                    )}
                     {room.status === "PLAYING" &&
                       room.state.turn === 0 &&
                       hero &&
@@ -1318,7 +1504,7 @@ export default function App() {
                         </small>
                         {room.status === "PLAYING" &&
                           n.alive &&
-                          n.location === room.state.scene?.location &&
+                          npcPresent(n) &&
                           hero &&
                           hero.hp > 0 && (
                             <button

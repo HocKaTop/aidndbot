@@ -268,23 +268,30 @@ func TestTurnRulesAndRollback(t *testing.T) {
 	before := string(blob(saved.State))
 	eventCount := len(events)
 	cmd.Data.Text = "Иду в соседнюю комнату"
-	for _, failNarration := range []bool{false, true} {
-		model.actions = []game.Action{{Type: "MOVE_SCENE", Name: "Changed", Description: "New scene"}}
-		model.failNarration = failNarration
-		if !failNarration {
-			model.actions = append(model.actions, game.Action{Type: "UNKNOWN"})
-		}
-		if e = s.command(ctx, room.ID, 1, cmd); e == nil {
-			t.Fatal("invalid turn succeeded")
-		}
-		current, e := s.load(ctx, room.ID, 1)
-		if e != nil || string(blob(current.State)) != before {
-			t.Fatal("partial state committed", e)
-		}
-		events, e = s.eventList(ctx, room.ID)
-		if e != nil || len(events) != eventCount {
-			t.Fatal("partial history committed", e)
-		}
+	model.actions = []game.Action{{Type: "MOVE_SCENE", Name: "Changed", Description: "New scene"}, {Type: "UNKNOWN"}}
+	if e = s.command(ctx, room.ID, 1, cmd); e == nil {
+		t.Fatal("invalid plan succeeded")
+	}
+	current, e := s.load(ctx, room.ID, 1)
+	if e != nil || string(blob(current.State)) != before {
+		t.Fatal("invalid plan changed state", e)
+	}
+	events, e = s.eventList(ctx, room.ID)
+	if e != nil || len(events) != eventCount {
+		t.Fatal("invalid plan changed history", e)
+	}
+	model.actions = []game.Action{{Type: "MOVE_SCENE", Name: "Changed", Description: "New scene"}}
+	model.failNarration = true
+	if e = s.command(ctx, room.ID, 1, cmd); e != nil {
+		t.Fatal("narration fallback failed", e)
+	}
+	current, e = s.load(ctx, room.ID, 1)
+	if e != nil || current.State.Scene.Title != "Changed" || current.State.Turn != saved.State.Turn+1 {
+		t.Fatal("narration failure lost confirmed mechanics", e)
+	}
+	events, e = s.eventList(ctx, room.ID)
+	if e != nil || len(events) <= eventCount || events[len(events)-1].Type != "GM_MESSAGE" {
+		t.Fatal("fallback did not save a readable turn", e)
 	}
 	// Consuming a potion in combat must cost a turn and allow an enemy response.
 	_, e = s.mutate(ctx, room.ID, 1, false, func(q *store.Queries, r *Room) error {
@@ -301,11 +308,11 @@ func TestTurnRulesAndRollback(t *testing.T) {
 	if e = s.command(ctx, room.ID, 1, cmd); e != nil {
 		t.Fatal(e)
 	}
-	current, e := s.load(ctx, room.ID, 1)
+	current, e = s.load(ctx, room.ID, 1)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if current.State.Turn != 2 || current.State.Characters[0].Inventory[0].Quantity != 1 {
+	if current.State.Turn != saved.State.Turn+2 || current.State.Characters[0].Inventory[0].Quantity != 1 {
 		t.Fatal("potion did not consume turn/item")
 	}
 	events, e = s.eventList(ctx, room.ID)

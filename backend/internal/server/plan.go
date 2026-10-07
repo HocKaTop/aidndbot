@@ -15,6 +15,13 @@ import (
 // Repair at most once, before any dice or changes. The command's existing context
 // bounds both attempts and narration; there is no retry of an executed turn.
 func (s *Server) planTurn(ctx context.Context, rid string, input ai.Input) (ai.Output, error) {
+	if !input.Opening {
+		intent, err := turnIntent(input.State, input.PlayerID, input.Text)
+		if err != nil {
+			return ai.Output{}, err
+		}
+		input.Intent = &intent
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return ai.Output{}, aiFailure(err)
@@ -31,12 +38,21 @@ func (s *Server) planTurn(ctx context.Context, rid string, input ai.Input) (ai.O
 			return ai.Output{}, aiFailure(err)
 		}
 		err = game.ValidateActions(&input.State, input.PlayerID, out.Actions)
+		if err == nil && !input.Opening {
+			err = validateAttackPlan(&input.State, input.Text, out.Actions)
+		}
+		if err == nil && !input.Opening {
+			err = validateInventoryPlan(input.Intent, out.Actions)
+		}
+		if err == nil {
+			err = validatePhysicalNarrative(input, out.Actions, out.Narrative)
+		}
 		if err == nil && input.Opening {
 			err = validateOpening(out.Actions)
 		}
 		if err == nil && !input.Opening {
 			for _, action := range out.Actions {
-				if action.Type == "MOVE_SCENE" && !explicitTravel(input.Text) {
+				if (action.Type == "MOVE_SCENE" || action.Type == "REVISIT_SCENE") && !input.Intent.SceneChange {
 					err = errors.New("игрок не просил перейти в другую локацию; оставайся в текущей сцене")
 					break
 				}
@@ -45,7 +61,7 @@ func (s *Server) planTurn(ctx context.Context, rid string, input ai.Input) (ai.O
 		if err == nil && strings.TrimSpace(out.Narrative) == "" {
 			err = errors.New("нужно непустое повествование")
 		}
-		if err == nil {
+		if err == nil && (input.Opening || len(out.Actions) == 0) {
 			err = validateStoryNarrative(input.State, input.PlayerID, out.Actions, nil, out.Narrative)
 		}
 		if err == nil {
@@ -65,13 +81,7 @@ func (s *Server) planTurn(ctx context.Context, rid string, input ai.Input) (ai.O
 }
 
 func explicitTravel(text string) bool {
-	text = strings.ToLower(text)
-	for _, cue := range []string{"иду ", "идём ", "идем ", "пойду", "пойдём", "пойдем", "идти ", "идти к", "войти", "входим", "вхожу", "зайти", "захожу", "выход", "выхожу", "выйти", "перейти", "перехожу", "спуст", "подним", "отправ", "направля", "возвращ", "вернут", "бегу", "бежим", "прохожу через", "пройти через", "следую за", "следовать за", "добира", "дойти до"} {
-		if strings.Contains(text, cue) {
-			return true
-		}
-	}
-	return false
+	return playerIntent(text).SceneChange
 }
 
 // A narration repair sees the exact same engine results. It must never replan
@@ -91,6 +101,11 @@ func (s *Server) narrateTurn(ctx context.Context, rid string, input ai.Input) (a
 				err = fmt.Errorf("%w: %v", ai.ErrInvalidResponse, issue)
 			}
 		}
+		if err == nil {
+			if issue := validatePhysicalNarrative(input, nil, out.Narrative); issue != nil {
+				err = fmt.Errorf("%w: %v", ai.ErrInvalidResponse, issue)
+			}
+		}
 		slog.Info("AI narration", "room", rid, "attempt", attempt+1, "duration", time.Since(started), "success", err == nil)
 		if err == nil {
 			return out, nil
@@ -105,17 +120,27 @@ func (s *Server) narrateTurn(ctx context.Context, rid string, input ai.Input) (a
 }
 
 var (
-	questCompletionClaim    = regexp.MustCompile(`(?i)(квест|задани[ея]|цель|мисси[яию]|задач[а-я]*).{0,70}(заверш[её]н[аоы]?|выполнен[аоы]?|окончен[аоы]?)`)
-	campaignCompletionClaim = regexp.MustCompile(`(?i)(приключени[ея]|кампани[яию]).{0,60}(заверш[её]н[аоы]?|выполнен[аоы]?|окончен[аоы]?)`)
-	lanternStoneClaim       = regexp.MustCompile(`(?i)(вы|ты) (принимаете|принимаешь|забираете|забираешь|берёте|берете|берёшь|берешь)[^.!?]{0,35}(камень|кристалл)`)
+	questCompletionClaim    = regexp.MustCompile(`(?i)(квест|задани[ея]|цель|мисси[яию]|задач[а-я]*)[^.!?\n]{0,70}(заверш[её]н[аоы]?|выполнен[аоы]?|окончен[аоы]?)`)
+	questFailureClaim       = regexp.MustCompile(`(?i)(квест|задани[ея]|цель|мисси[яию]|задач[а-я]*)[^.!?\n]{0,70}(провален[аоы]?|потерян[аоы]?)`)
+	campaignCompletionClaim = regexp.MustCompile(`(?i)(приключени[ея]|кампани[яию])[^.!?\n]{0,60}(заверш[её]н[аоы]?|выполнен[аоы]?|окончен[аоы]?)`)
+	lanternStoneClaim       = regexp.MustCompile(`(?i)(вы|ты)(?:\s+[\p{L}-]+){0,3}\s+(принимаете|принимаешь|забираете|забираешь|берёте|берете|берёшь|берешь|получаете|получаешь|подбираете|подбираешь)[^.!?\n]{0,45}(камень|кристалл|его дар)`)
 )
 
 func claimsCompletion(pattern *regexp.Regexp, narrative string) bool {
 	for _, bounds := range pattern.FindAllStringIndex(narrative, -1) {
 		claim := strings.ToLower(narrative[bounds[0]:bounds[1]])
-		if !strings.Contains(claim, "не заверш") && !strings.Contains(claim, "не выполн") && !strings.Contains(claim, "не окончен") {
-			return true
+		if strings.Contains(claim, "не заверш") || strings.Contains(claim, "не выполн") || strings.Contains(claim, "не окончен") || strings.Contains(claim, "не провал") || strings.Contains(claim, "не потерян") {
+			continue
 		}
+		if strings.Contains(claim, "будет ") || strings.Contains(claim, "может быть ") || strings.Contains(claim, "должн") || strings.Contains(claim, "нужн") {
+			continue
+		}
+		start := strings.LastIndexAny(narrative[:bounds[0]], ".!?\n;") + 1
+		context := strings.ToLower(narrative[start:bounds[0]])
+		if strings.Contains(context, "если ") || strings.Contains(context, "когда ") || strings.Contains(context, "как только ") || strings.Contains(context, "чтобы ") || strings.Contains(context, "после того как ") {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -123,22 +148,30 @@ func claimsCompletion(pattern *regexp.Regexp, narrative string) bool {
 // Story outcomes in prose must match engine transitions for every setting.
 func validateStoryNarrative(state game.State, user int64, actions []game.Action, results []game.Result, narrative string) error {
 	completedQuest := false
+	failedQuest := false
 	activeQuest := false
 	for _, quest := range state.Quests {
 		completedQuest = completedQuest || quest.Status == "COMPLETED"
+		failedQuest = failedQuest || quest.Status == "FAILED"
 		activeQuest = activeQuest || quest.Status == "ACTIVE"
 	}
 	finishAction := false
 	completedNow := false
+	failedNow := false
 	for _, action := range actions {
 		completedNow = completedNow || action.Type == "UPDATE_QUEST" && action.Status == "COMPLETED"
+		failedNow = failedNow || action.Type == "UPDATE_QUEST" && action.Status == "FAILED"
 		finishAction = finishAction || action.Type == "FINISH_CAMPAIGN"
 	}
 	for _, result := range results {
 		completedNow = completedNow || result.Type == "UPDATE_QUEST" && result.Status == "COMPLETED"
+		failedNow = failedNow || result.Type == "UPDATE_QUEST" && result.Status == "FAILED"
 	}
 	if claimsCompletion(questCompletionClaim, narrative) && ((!completedQuest && !completedNow) || (activeQuest && !completedNow)) {
 		return errors.New("нельзя объявлять цель выполненной без подтверждённого результата; в пользовательской кампании предложи PROPOSE_QUEST_COMPLETION и опиши итог как предварительный")
+	}
+	if claimsCompletion(questFailureClaim, narrative) && ((!failedQuest && !failedNow) || (activeQuest && !failedNow)) {
+		return errors.New("нельзя объявлять цель проваленной без подтверждённого исхода")
 	}
 	if claimsCompletion(campaignCompletionClaim, narrative) && state.Ending == nil && !finishAction {
 		lanternFinish := state.Settings.LastLantern() && len(state.Quests) > 0
@@ -152,10 +185,20 @@ func validateStoryNarrative(state game.State, user int64, actions []game.Action,
 			return errors.New("нельзя объявлять кампанию завершённой без FINISH_CAMPAIGN")
 		}
 	}
+	if err := validateWorldClaims(state, user, actions, results, narrative); err != nil {
+		return err
+	}
 	if !state.Settings.LastLantern() {
 		return nil
 	}
-	if lanternStoneClaim.MatchString(narrative) {
+	stoneClaim := false
+	for _, claim := range lanternStoneClaim.FindAllString(narrative, -1) {
+		if !strings.Contains(strings.ToLower(claim), " не ") {
+			stoneClaim = true
+			break
+		}
+	}
+	if stoneClaim {
 		stone := false
 		if hero := state.Hero(user); hero != nil {
 			for _, item := range hero.Inventory {

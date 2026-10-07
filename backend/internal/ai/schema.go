@@ -24,9 +24,10 @@ func responseSchema(in Input) json.RawMessage {
 			Skill       any `json:"skill,omitempty"`
 			DC          any `json:"dc,omitempty"`
 			Status      any `json:"status,omitempty"`
-		}{jsonSchema{"const": kind}, fields["target"], fields["name"], fields["description"], fields["skill"], fields["dc"], fields["status"]}
+			Threat      any `json:"threat,omitempty"`
+		}{jsonSchema{"const": kind}, fields["target"], fields["name"], fields["description"], fields["skill"], fields["dc"], fields["status"], fields["threat"]}
 		required := []string{"type"}
-		for _, key := range []string{"target", "name", "description", "skill", "dc", "status"} {
+		for _, key := range []string{"target", "name", "description", "skill", "dc", "status", "threat"} {
 			if _, ok := fields[key]; ok {
 				required = append(required, key)
 			}
@@ -37,10 +38,14 @@ func responseSchema(in Input) json.RawMessage {
 		"ATTACK":                   action("ATTACK", jsonSchema{"target": text}),
 		"SKILL_CHECK":              action("SKILL_CHECK", jsonSchema{"skill": jsonSchema{"enum": []string{"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}}, "dc": jsonSchema{"type": "integer", "minimum": 5, "maximum": 25}}),
 		"DICE_ROLL":                action("DICE_ROLL", jsonSchema{"name": jsonSchema{"type": "string", "pattern": game.DiceNotationPattern}}),
-		"CREATE_NPC":               action("CREATE_NPC", jsonSchema{"name": text, "description": text, "status": disposition}),
+		"CREATE_NPC":               action("CREATE_NPC", jsonSchema{"name": text, "description": text, "status": disposition, "threat": jsonSchema{"enum": []string{"minor", "standard", "elite"}}}),
 		"UPDATE_NPC":               action("UPDATE_NPC", jsonSchema{"target": text, "description": text}),
+		"MOVE_NPC":                 action("MOVE_NPC", jsonSchema{"target": text, "name": text}),
 		"SET_DISPOSITION":          action("SET_DISPOSITION", jsonSchema{"target": text, "status": disposition}),
 		"MOVE_SCENE":               action("MOVE_SCENE", jsonSchema{"name": text, "description": text}),
+		"CREATE_LOCATION":          action("CREATE_LOCATION", jsonSchema{"name": text, "description": text}),
+		"REVISIT_SCENE":            action("REVISIT_SCENE", jsonSchema{"target": text}),
+		"RECORD_LOCATION_FACT":     action("RECORD_LOCATION_FACT", jsonSchema{"description": jsonSchema{"type": "string", "minLength": 1, "maxLength": 300}}),
 		"ADD_ITEM":                 action("ADD_ITEM", jsonSchema{"name": text, "description": text}),
 		"REMOVE_ITEM":              action("REMOVE_ITEM", jsonSchema{"target": text}),
 		"START_COMBAT":             action("START_COMBAT", nil),
@@ -48,12 +53,17 @@ func responseSchema(in Input) json.RawMessage {
 		"CREATE_QUEST":             action("CREATE_QUEST", jsonSchema{"name": text, "description": text}),
 		"UPDATE_QUEST":             action("UPDATE_QUEST", jsonSchema{"target": text, "status": jsonSchema{"enum": []string{"COMPLETED", "FAILED"}}}),
 		"PROPOSE_QUEST_COMPLETION": action("PROPOSE_QUEST_COMPLETION", jsonSchema{"target": text, "description": text}),
+		"PROPOSE_QUEST_FAILURE":    action("PROPOSE_QUEST_FAILURE", jsonSchema{"target": text, "description": text}),
 	}
 	if in.State.Settings.LastLantern() || in.Opening || in.State.PendingQuestCompletion != nil || in.State.Combat || in.State.HasEnemies() {
 		delete(defs, "PROPOSE_QUEST_COMPLETION")
+		delete(defs, "PROPOSE_QUEST_FAILURE")
+	}
+	if in.State.Scene == nil || len(in.State.Scene.Facts) >= 20 {
+		delete(defs, "RECORD_LOCATION_FACT")
 	}
 	if !in.State.Settings.LastLantern() {
-		defs["UPDATE_QUEST"] = action("UPDATE_QUEST", jsonSchema{"target": text, "status": jsonSchema{"enum": []string{"FAILED"}}})
+		delete(defs, "UPDATE_QUEST")
 	}
 	if in.State.Settings.LastLantern() && in.Results == nil && !in.Opening {
 		// The main objective has other approaches after a failed conversation;
@@ -82,7 +92,7 @@ func responseSchema(in Input) json.RawMessage {
 			inventory = append(inventory, item.ID)
 		}
 	}
-	for kind, ids := range map[string][]string{"ATTACK": localNPCs, "SET_DISPOSITION": localNPCs, "UPDATE_NPC": allNPCs, "UPDATE_QUEST": quests, "PROPOSE_QUEST_COMPLETION": quests, "REMOVE_ITEM": inventory} {
+	for kind, ids := range map[string][]string{"ATTACK": localNPCs, "SET_DISPOSITION": localNPCs, "UPDATE_NPC": allNPCs, "UPDATE_QUEST": quests, "PROPOSE_QUEST_COMPLETION": quests, "PROPOSE_QUEST_FAILURE": quests, "REMOVE_ITEM": inventory} {
 		if _, allowed := defs[kind]; !allowed {
 			continue
 		}
@@ -102,10 +112,32 @@ func responseSchema(in Input) json.RawMessage {
 				allowed = []string{"COMPLETED"}
 			}
 			fields["status"] = jsonSchema{"enum": allowed}
-		case "PROPOSE_QUEST_COMPLETION":
+		case "PROPOSE_QUEST_COMPLETION", "PROPOSE_QUEST_FAILURE":
 			fields["description"] = text
 		}
 		defs[kind] = action(kind, fields)
+	}
+	locations := []string{}
+	revisitable := []string{}
+	for _, place := range in.State.Locations {
+		locations = append(locations, place.ID)
+		if in.State.Scene == nil || place.ID != in.State.Scene.ID {
+			revisitable = append(revisitable, place.ID)
+		}
+	}
+	if len(locations) == 0 {
+		delete(defs, "REVISIT_SCENE")
+	} else {
+		if len(revisitable) == 0 {
+			delete(defs, "REVISIT_SCENE")
+		} else {
+			defs["REVISIT_SCENE"] = action("REVISIT_SCENE", jsonSchema{"target": jsonSchema{"type": "string", "enum": revisitable}})
+		}
+	}
+	if len(allNPCs) == 0 {
+		delete(defs, "MOVE_NPC")
+	} else {
+		defs["MOVE_NPC"] = action("MOVE_NPC", jsonSchema{"target": jsonSchema{"type": "string", "enum": allNPCs}, "name": text})
 	}
 	ref := func(name string) jsonSchema { return jsonSchema{"$ref": "#/$defs/" + name} }
 	union := func(names ...string) jsonSchema {
@@ -120,7 +152,11 @@ func responseSchema(in Input) json.RawMessage {
 		}
 		return jsonSchema{"anyOf": options}
 	}
-	defs["nonmechanical"] = union("CREATE_NPC", "UPDATE_NPC", "SET_DISPOSITION", "MOVE_SCENE", "ADD_ITEM", "REMOVE_ITEM", "START_COMBAT", "END_COMBAT", "CREATE_QUEST", "UPDATE_QUEST", "PROPOSE_QUEST_COMPLETION")
+	nonmechanical := []string{"CREATE_NPC", "UPDATE_NPC", "MOVE_NPC", "SET_DISPOSITION", "MOVE_SCENE", "CREATE_LOCATION", "REVISIT_SCENE", "RECORD_LOCATION_FACT", "ADD_ITEM", "REMOVE_ITEM", "START_COMBAT", "END_COMBAT", "CREATE_QUEST", "UPDATE_QUEST", "PROPOSE_QUEST_COMPLETION", "PROPOSE_QUEST_FAILURE"}
+	if in.Intent != nil && in.Intent.HeldItemID != "" && in.Results == nil {
+		delete(defs, "ADD_ITEM")
+	}
+	defs["nonmechanical"] = union(nonmechanical...)
 	// Fixed tuples avoid mixing prefixItems with an items schema: Ollama's
 	// grammar converter does not enforce that combination consistently.
 	tuple := func(items []jsonSchema) jsonSchema {
@@ -142,6 +178,53 @@ func responseSchema(in Input) json.RawMessage {
 		}
 		actions = jsonSchema{"anyOf": options}
 	default:
+		required := ""
+		if in.Intent != nil {
+			if in.Intent.ItemRequest != "" {
+				required = "ADD_ITEM"
+			} else if in.Intent.GiveItemID != "" {
+				required = "REMOVE_ITEM"
+				defs[required] = action(required, jsonSchema{"target": jsonSchema{"const": in.Intent.GiveItemID}})
+			}
+		}
+		if required != "" {
+			others := []string{}
+			for _, name := range nonmechanical {
+				if name != required {
+					others = append(others, name)
+				}
+			}
+			defs["otherEffects"] = union(others...)
+			options := []jsonSchema{{"type": "array", "maxItems": 0, "items": ref("otherEffects")}}
+			for size := 1; size <= 4; size++ {
+				for effectPosition := 0; effectPosition < size; effectPosition++ {
+					for mechanicPosition := -1; mechanicPosition < size; mechanicPosition++ {
+						if mechanicPosition == effectPosition {
+							continue
+						}
+						mechanic := union("ATTACK", "DICE_ROLL")
+						if mechanicPosition == 0 {
+							mechanic = union("ATTACK", "DICE_ROLL", "SKILL_CHECK")
+						}
+						if mechanicPosition >= 0 && mechanic == nil {
+							continue
+						}
+						items := make([]jsonSchema, size)
+						for i := range items {
+							items[i] = ref("otherEffects")
+							if i == effectPosition {
+								items[i] = ref(required)
+							} else if i == mechanicPosition {
+								items[i] = mechanic
+							}
+						}
+						options = append(options, tuple(items))
+					}
+				}
+			}
+			actions = jsonSchema{"anyOf": options}
+			break
+		}
 		options := []jsonSchema{{"type": "array", "maxItems": 4, "items": ref("nonmechanical")}}
 		firstMechanic := union("ATTACK", "DICE_ROLL", "SKILL_CHECK")
 		laterMechanic := union("ATTACK", "DICE_ROLL")

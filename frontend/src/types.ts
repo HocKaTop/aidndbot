@@ -31,6 +31,8 @@ export type Hero = {
   armorClass: number;
   resource?: number;
   resourceMax?: number;
+  lastRestLocationId?: string;
+  restedLocationIds?: string[];
   stats: Record<string, number>;
   inventory: Item[];
 };
@@ -42,7 +44,12 @@ export type Room = {
   inviteUrl: string;
   members: { userId: number; name: string; role: string; ready: boolean }[];
   state: {
-    pendingQuestCompletion?: { questId: string; reason: string };
+    pendingQuestCompletion?: {
+      id: string;
+      questId: string;
+      reason: string;
+      status?: "COMPLETED" | "FAILED";
+    };
     ending?: {
       reason: "owner" | "defeat" | "objective";
       note: string;
@@ -59,6 +66,8 @@ export type Room = {
       alive: boolean;
       disposition: string;
       location?: string;
+      locationId?: string;
+      threat?: "minor" | "standard" | "elite";
     }[];
     quests: {
       id: string;
@@ -66,7 +75,15 @@ export type Room = {
       description: string;
       status: string;
     }[];
-    scene: { title: string; description: string; location: string } | null;
+    scene: {
+      id?: string;
+      title: string;
+      description: string;
+      location: string;
+      facts?: string[];
+      exits?: string[];
+    } | null;
+    locations?: { id: string; title: string; location: string }[];
     combat: boolean;
     combatOrder?: number[];
     combatIndex?: number;

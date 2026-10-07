@@ -42,21 +42,23 @@ type Item struct {
 	Type        string `json:"type"`
 }
 type Character struct {
-	ID          string `json:"id"`
-	UserID      int64  `json:"userId"`
-	Name        string `json:"name"`
-	Race        string `json:"race"`
-	Class       string `json:"class"`
-	ClassID     string `json:"classId,omitempty"`
-	Level       int    `json:"level"`
-	HP          int    `json:"hp"`
-	MaxHP       int    `json:"maxHp"`
-	ArmorClass  int    `json:"armorClass"`
-	Experience  int    `json:"experience"`
-	Resource    int    `json:"resource,omitempty"`
-	ResourceMax int    `json:"resourceMax,omitempty"`
-	Stats       Stats  `json:"stats"`
-	Inventory   []Item `json:"inventory"`
+	ID                 string   `json:"id"`
+	UserID             int64    `json:"userId"`
+	Name               string   `json:"name"`
+	Race               string   `json:"race"`
+	Class              string   `json:"class"`
+	ClassID            string   `json:"classId,omitempty"`
+	Level              int      `json:"level"`
+	HP                 int      `json:"hp"`
+	MaxHP              int      `json:"maxHp"`
+	ArmorClass         int      `json:"armorClass"`
+	Experience         int      `json:"experience"`
+	Resource           int      `json:"resource,omitempty"`
+	ResourceMax        int      `json:"resourceMax,omitempty"`
+	LastRestLocationID string   `json:"lastRestLocationId,omitempty"`
+	RestedLocationIDs  []string `json:"restedLocationIds,omitempty"`
+	Stats              Stats    `json:"stats"`
+	Inventory          []Item   `json:"inventory"`
 }
 type NPC struct {
 	ID          string `json:"id"`
@@ -68,6 +70,8 @@ type NPC struct {
 	Alive       bool   `json:"alive"`
 	Disposition string `json:"disposition"`
 	Location    string `json:"location"`
+	LocationID  string `json:"locationId,omitempty"`
+	Threat      string `json:"threat,omitempty"`
 }
 type Quest struct {
 	ID          string `json:"id"`
@@ -77,14 +81,18 @@ type Quest struct {
 	Rewarded    bool   `json:"rewarded,omitempty"`
 }
 type Scene struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Location    string `json:"location"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Location    string   `json:"location"`
+	Facts       []string `json:"facts,omitempty"`
+	Exits       []string `json:"exits,omitempty"`
 }
 type QuestCompletionProposal struct {
+	ID      string `json:"id"`
 	QuestID string `json:"questId"`
 	Reason  string `json:"reason"`
+	Status  string `json:"status,omitempty"`
 }
 type State struct {
 	Ending                 *Ending                  `json:"ending,omitempty"`
@@ -94,6 +102,7 @@ type State struct {
 	NPCs                   []NPC                    `json:"npcs"`
 	Quests                 []Quest                  `json:"quests"`
 	Scene                  *Scene                   `json:"scene"`
+	Locations              []Scene                  `json:"locations,omitempty"`
 	Combat                 bool                     `json:"combat"`
 	CombatOrder            []int64                  `json:"combatOrder,omitempty"`
 	CombatIndex            int                      `json:"combatIndex"`
@@ -101,6 +110,7 @@ type State struct {
 	CombatTurnSince        time.Time                `json:"combatTurnSince"`
 	NPCResponseCount       int                      `json:"npcResponseCount,omitempty"`
 	Summary                string                   `json:"summary"`
+	PlayerHistory          []string                 `json:"playerHistory,omitempty"`
 	GMNotes                []string                 `json:"gmNotes,omitempty"`
 	Turn                   int                      `json:"turn"`
 }
@@ -125,12 +135,21 @@ func (s State) Clone() State {
 	s.Characters = slices.Clone(s.Characters)
 	for i := range s.Characters {
 		s.Characters[i].Inventory = slices.Clone(s.Characters[i].Inventory)
+		s.Characters[i].RestedLocationIDs = slices.Clone(s.Characters[i].RestedLocationIDs)
 	}
 	s.NPCs = slices.Clone(s.NPCs)
 	s.Quests = slices.Clone(s.Quests)
+	s.Locations = slices.Clone(s.Locations)
+	for i := range s.Locations {
+		s.Locations[i].Facts = slices.Clone(s.Locations[i].Facts)
+		s.Locations[i].Exits = slices.Clone(s.Locations[i].Exits)
+	}
 	s.GMNotes = slices.Clone(s.GMNotes)
+	s.PlayerHistory = slices.Clone(s.PlayerHistory)
 	if s.Scene != nil {
 		scene := *s.Scene
+		scene.Facts = slices.Clone(scene.Facts)
+		scene.Exits = slices.Clone(scene.Exits)
 		s.Scene = &scene
 	}
 	if s.PendingQuestCompletion != nil {
@@ -163,7 +182,56 @@ func (s *State) Present(n NPC) bool {
 	if s.Scene == nil {
 		return n.Location == ""
 	}
+	if n.LocationID != "" {
+		return n.LocationID == s.Scene.ID
+	}
 	return n.Location == s.Scene.Location
+}
+
+func (s *State) Location(id string) *Scene {
+	for i := range s.Locations {
+		if s.Locations[i].ID == id {
+			return &s.Locations[i]
+		}
+	}
+	return nil
+}
+
+// A plan can refer to a newly created place by title, or to the party's new
+// scene after MOVE_SCENE. Saved NPCs always retain the resolved location ID.
+func (s *State) ResolveLocation(ref string) *Scene {
+	if ref == "@current" {
+		if s.Scene != nil && s.Scene.ID != "" {
+			return s.Scene
+		}
+		return nil
+	}
+	if place := s.Location(ref); place != nil {
+		return place
+	}
+	var found *Scene
+	for i := range s.Locations {
+		if strings.EqualFold(strings.TrimSpace(s.Locations[i].Title), strings.TrimSpace(ref)) {
+			if found != nil {
+				return nil // Ambiguous legacy names require an explicit ID.
+			}
+			found = &s.Locations[i]
+		}
+	}
+	return found
+}
+
+// RememberLocation also upgrades rooms created before the location list existed.
+func (s *State) RememberLocation(scene Scene) {
+	if scene.ID == "" || s.Location(scene.ID) != nil {
+		return
+	}
+	s.Locations = append(s.Locations, scene)
+	for i := range s.NPCs {
+		if s.NPCs[i].LocationID == "" && s.NPCs[i].Location == scene.Location {
+			s.NPCs[i].LocationID = scene.ID
+		}
+	}
 }
 func (s *State) HasEnemies() bool {
 	for _, n := range s.NPCs {

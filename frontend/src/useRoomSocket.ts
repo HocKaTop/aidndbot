@@ -222,14 +222,20 @@ export function useRoomSocket(
           "player_action",
           "attack_npc",
           "use_item",
+          "aid_ally",
+          "short_rest",
           "class_ability",
           "pass_turn",
           "defend_turn",
+          "retreat",
           "skip_turn",
           "finish_game",
           "claim_stone",
           "return_to_bridge",
           "install_stone",
+          "confirm_quest",
+          "continue_quest",
+          "reopen_quest",
         ].includes(type)
       )
         packet.expectedTurn = turn;

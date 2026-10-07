@@ -2,10 +2,40 @@ package ai
 
 import (
 	"dnd-bot/backend/internal/game"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestCustomSettingCorrectionsFitDefaultContext(t *testing.T) {
+	data, err := os.ReadFile("testdata/custom_context.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Name  string `json:"name"`
+		Input Input  `json:"input"`
+	}
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			before, _ := json.Marshal(tc.Input)
+			out, err := prepareInput(tc.Input, DefaultContextWindow)
+			if err != nil {
+				t.Fatal("a short custom campaign could not repair its plan", err)
+			}
+			after, _ := json.Marshal(tc.Input)
+			if string(before) != string(after) || out.Text != tc.Input.Text || out.Correction.Reason != tc.Input.Correction.Reason || len(out.State.Characters) != len(tc.Input.State.Characters) {
+				t.Fatal("context preparation changed the source or dropped the player's action")
+			}
+		})
+	}
+}
 
 func TestContextBudget(t *testing.T) {
 	state := game.NewState(game.Settings{Name: "Test"})
@@ -50,5 +80,45 @@ func TestDefaultContextFitsPartyAndNarration(t *testing.T) {
 	in.State.Turn = 8
 	if _, err := prepareInput(in, DefaultContextWindow); err != nil {
 		t.Fatal("paced multiplayer planning exceeds default budget", err)
+	}
+	in.Text = "Атакую стражника " + strings.Repeat("я", 980)
+	in.Intent = &PlayerIntent{}
+	if _, err := prepareInput(in, DefaultContextWindow); err != nil {
+		t.Fatal("attack planning exceeds default budget", err)
+	}
+}
+
+func TestRemoteWorldDoesNotBlockOrdinaryTurn(t *testing.T) {
+	state := game.NewState(game.Settings{Name: "Экспедиция"})
+	state.Scene = &game.Scene{ID: "tavern", Title: "Таверна", Location: "Таверна"}
+	state.Locations = []game.Scene{*state.Scene}
+	state.Characters = []game.Character{game.NewCharacter(1, "Герой", "Человек", "Воин")}
+	for i := 0; i < 9; i++ {
+		state.NPCs = append(state.NPCs, game.NPC{ID: string(rune('a' + i)), Name: "Чужой", Description: strings.Repeat("с", 720), Alive: true, LocationID: "remote"})
+	}
+	in := Input{State: state, PlayerID: 1, Text: "Осматриваю таверну"}
+	out, err := prepareInput(in, DefaultContextWindow)
+	if err != nil {
+		t.Fatal("remote NPC descriptions blocked a local action", err)
+	}
+	if len(out.State.NPCs) != 9 || out.State.NPCs[0].Description != "" || state.NPCs[0].Description == "" {
+		t.Fatal("projection lost references or mutated saved state")
+	}
+}
+
+func TestOldLocationsRemainAvailableWhenNamed(t *testing.T) {
+	state := game.NewState(game.Settings{Name: "Экспедиция"})
+	state.Scene = &game.Scene{ID: "current", Title: "Текущий зал", Location: "Текущий зал"}
+	for i := 0; i < 100; i++ {
+		state.Locations = append(state.Locations, game.Scene{ID: fmt.Sprintf("place-%d", i), Title: fmt.Sprintf("Комната %d", i), Description: strings.Repeat("детали", 100)})
+	}
+	state.Locations = append(state.Locations, *state.Scene)
+	input := Input{State: state, Text: "Возвращаюсь в Комнату 0"}
+	out, err := prepareInput(input, DefaultContextWindow)
+	if err != nil {
+		t.Fatal("old locations blocked the turn", err)
+	}
+	if len(out.State.Locations) > 16 || out.State.Location("place-0") == nil || out.State.Location("current") == nil || len(state.Locations) != 101 {
+		t.Fatal("named location was lost or saved world mutated")
 	}
 }

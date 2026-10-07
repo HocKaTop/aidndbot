@@ -84,6 +84,50 @@ func TestQuestProposalOnlyAvailableInSafeCustomStory(t *testing.T) {
 	}
 }
 
+func TestPhysicalItemSchemaRequiresTheEffectOrNoTransfer(t *testing.T) {
+	state := game.NewState(game.Settings{Name: "Архив"})
+	state.Characters = []game.Character{game.NewCharacter(1, "Лея", "", "")}
+	for _, tc := range []struct {
+		intent PlayerIntent
+		kind   string
+	}{
+		{PlayerIntent{ItemRequest: "цилиндр"}, "ADD_ITEM"},
+		{PlayerIntent{GiveItemID: state.Characters[0].Inventory[0].ID}, "REMOVE_ITEM"},
+	} {
+		var schema struct {
+			Properties struct {
+				Actions struct {
+					AnyOf []struct {
+						MaxItems int             `json:"maxItems"`
+						Items    json.RawMessage `json:"items"`
+					} `json:"anyOf"`
+				} `json:"actions"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(responseSchema(Input{State: state, PlayerID: 1, Intent: &tc.intent}), &schema); err != nil {
+			t.Fatal(err)
+		}
+		for _, branch := range schema.Properties.Actions.AnyOf {
+			if branch.MaxItems == 0 {
+				continue // Refusal/dialogue cannot mechanically transfer anything.
+			}
+			var items []map[string]json.RawMessage
+			if err := json.Unmarshal(branch.Items, &items); err != nil {
+				t.Fatal(err)
+			}
+			count := 0
+			for _, item := range items {
+				if string(item["$ref"]) == `"#/$defs/`+tc.kind+`"` {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatal("Ollama can select a check without its inventory consequence", tc.kind, string(branch.Items))
+			}
+		}
+	}
+}
+
 // Opt-in smoke test for the installed Ollama grammar. Uses a synthetic room.
 func TestLiveLastLanternWithoutAttackTarget(t *testing.T) {
 	endpoint, model := os.Getenv("OLLAMA_SMOKE_URL"), os.Getenv("OLLAMA_SMOKE_MODEL")

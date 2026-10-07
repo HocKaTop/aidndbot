@@ -1,8 +1,50 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Dices, Sparkles } from "lucide-react";
 import type { useRoomHistory } from "./useRoomHistory";
+import type { HistoryEvent } from "./types";
 
-export function EventJournal({ history }: { history: ReturnType<typeof useRoomHistory> }) {
+const JournalEntry = memo(function JournalEntry({
+  event,
+}: {
+  event: HistoryEvent;
+}) {
+  return (
+    <article
+      data-event-id={event.id}
+      className={
+        "event " +
+        (event.type === "GM_MESSAGE"
+          ? "gm"
+          : event.type === "PLAYER_ACTION"
+            ? "player"
+            : "mechanics")
+      }
+    >
+      <div className="eyebrow">
+        {event.type === "GM_MESSAGE" ? (
+          <>
+            <Sparkles size={13} />
+            Ведущий
+          </>
+        ) : event.type === "PLAYER_ACTION" ? (
+          "Действие игрока"
+        ) : (
+          <>
+            <Dices size={13} />
+            Правила мира
+          </>
+        )}
+      </div>
+      <p>{event.payload.text}</p>
+    </article>
+  );
+});
+
+export function EventJournal({
+  history,
+}: {
+  history: ReturnType<typeof useRoomHistory>;
+}) {
   const { events } = history;
   const root = useRef<HTMLDivElement>(null);
   const bottom = useRef<HTMLDivElement>(null);
@@ -94,35 +136,7 @@ export function EventJournal({ history }: { history: ReturnType<typeof useRoomHi
         </button>
       )}
       {events.map((event) => (
-        <article
-          key={event.id}
-          data-event-id={event.id}
-          className={
-            "event " +
-            (event.type === "GM_MESSAGE"
-              ? "gm"
-              : event.type === "PLAYER_ACTION"
-                ? "player"
-                : "mechanics")
-          }
-        >
-          <div className="eyebrow">
-            {event.type === "GM_MESSAGE" ? (
-              <>
-                <Sparkles size={13} />
-                Ведущий
-              </>
-            ) : event.type === "PLAYER_ACTION" ? (
-              "Действие игрока"
-            ) : (
-              <>
-                <Dices size={13} />
-                Правила мира
-              </>
-            )}
-          </div>
-          <p>{event.payload.text}</p>
-        </article>
+        <JournalEntry key={event.id} event={event} />
       ))}
       <div ref={bottom} />
     </div>

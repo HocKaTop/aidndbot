@@ -14,14 +14,24 @@ import (
 )
 
 type Input struct {
+	BeforeState        *game.State     `json:"-"` // Server-side evidence; never sent to the model.
 	Opening            bool            `json:"opening,omitempty"`
 	State              game.State      `json:"worldState"`
 	Recent             []string        `json:"recentEvents"`
 	PlayerID           int64           `json:"playerId"`
 	Text               string          `json:"playerAction"`
+	Intent             *PlayerIntent   `json:"playerIntent,omitempty"`
 	Results            []game.Result   `json:"engineResults,omitempty"`
 	Correction         *PlanCorrection `json:"planCorrection,omitempty"`
 	ResponseCorrection string          `json:"responseCorrection,omitempty"`
+}
+type PlayerIntent struct {
+	SceneChange   bool     `json:"sceneChange"`
+	ItemRequest   string   `json:"itemRequest,omitempty"`
+	GiveItemID    string   `json:"giveItemId,omitempty"`
+	HeldItemID    string   `json:"heldItemId,omitempty"`
+	ItemName      string   `json:"itemName,omitempty"`
+	CompanionNPCs []string `json:"companionNPCs,omitempty"`
 }
 type PlanCorrection struct {
 	Actions []game.Action `json:"rejectedActions"`
@@ -41,38 +51,61 @@ type Ollama struct {
 	ContextWindow int
 }
 
+// A home Ollama instance can be overwhelmed when several rooms act together.
+// Count HTTP requests, including narration and corrections, across providers.
+var ollamaRequests = make(chan struct{}, 2)
+
 func New(url string) *Ollama {
 	return &Ollama{URL: strings.TrimRight(url, "/"), Client: &http.Client{Timeout: 120 * time.Second}, ContextWindow: DefaultContextWindow}
 }
 func Prompt(in Input) string {
-	p := `Ты Game Master. Мир и стиль задают worldState.settings. Сюжет — по правилам владельца, механику считает сервер. Пиши по-русски кратко: обычный ход 1–2 коротких абзаца, 2–6 предложений. Дай последствия и новую информацию, не повторяй сцену и действие, не решай за героя. Учитывай worldState и recentEvents. gmNotes — тайные зацепки, раскрывай их через игру. В memory записывай лишь новые факты о мире и NPC, не о героях и их вещах. Заметки не заменяют actions. Сначала выбери actions, потом narrative. Верни один JSON: actions, narrative, memory.`
+	p := `Ты Game Master. Мир и стиль задают worldState.settings. Сюжет — по правилам владельца, механику считает сервер. Пиши по-русски кратко: обычный ход 1–2 коротких абзаца, 2–6 предложений. Дай последствия и новую информацию, не повторяй сцену и действие, не решай за героя. Учитывай worldState и recentEvents. playerHistory — намерения игроков; факты мира — state и summary. gmNotes — тайные зацепки, раскрывай их через игру. В memory записывай лишь новые факты о мире и NPC, не о героях и их вещах. Заметки не заменяют actions. Сначала выбери actions, потом narrative. Верни один JSON: actions, narrative, memory.`
 	p += fmt.Sprintf(" narrative — максимум %d символов; это потолок, а не желаемая длина.", narrativeMaxChars(in))
 	if in.State.Scene != nil {
-		p += fmt.Sprintf(" ТЕКУЩАЯ локация героя — %q. recentEvents могут описывать прошлые места. Не описывай переход или действия в другом месте без MOVE_SCENE; подход к человеку или предмету внутри сцены не меняет локацию.", in.State.Scene.Location)
+		p += fmt.Sprintf(" Текущая локация — %q. playerIntent.sceneChange=false запрещает переход. Прибытие в новое место требует MOVE_SCENE; в известное — REVISIT_SCENE по ID. Подход к объекту внутри сцены не меняет локацию.", in.State.Scene.Location)
 	}
 	if in.Results != nil {
-		p += ` Механика УЖЕ выполнена: actions=[]. Опиши engineResults, обычно 1 короткий абзац. Не повторяй броски и не меняй результаты. TURN_CHANGED указывает следующего игрока. PROPOSE_QUEST_COMPLETION — лишь предложение с причиной: цель активна, игрок может подтвердить итог или продолжить. GAME_FINISHED требует краткого эпилога; иначе не объявляй финал.`
+		p += ` Механика УЖЕ выполнена: actions=[]. Опиши engineResults, обычно 1 короткий абзац. Предметы и местоположение NPC — строго worldState: проверка без ADD_ITEM не выдала вещь; без REMOVE_ITEM её не передали; без MOVE_NPC персонаж не ушёл. Не повторяй броски. Предложения исхода цели не завершают её до подтверждения. GAME_FINISHED требует эпилога; иначе финала нет.`
 	} else if in.Opening {
+		p += ` Сохрани прямо заданную конечную цель владельца и её условия. Среди CREATE_NPC приоритет у названного участника главной цели, который находится в сцене; не заменяй его второстепенными NPC.`
 		p += ` Opening: максимум 2–3 коротких абзаца, без длинного пролога. Сам придумай место, ситуацию и ясную достижимую главную цель из сеттинга и worldDescription владельца. Цель сформулируй как проверяемое действие с понятным результатом и первой зацепкой: игрок должен знать, что ищет и зачем. Это конечная задача короткой кампании, а не первый шаг бесконечной цепочки; назови её игрокам во вступлении. Тайны оставь на пути к цели. Не превращай сеттинг в другой жанр и не решай за героя до первого действия. В memory запиши 1–3 скрытые зацепки или мотивы NPC, не добавляя вещи героям. Заверши вопросом «Что вы делаете?». actions: сначала MOVE_SCENE с name и description, затем один CREATE_QUEST с name и description; ещё допустимы до двух CREATE_NPC с name, description, status=friendly|neutral. Других действий нет.`
 		if in.Correction != nil {
 			p += ` Предыдущий план отклонён. Исправь его по planCorrection: обязательны сцена MOVE_SCENE и цель CREATE_QUEST в actions.`
 		}
 	} else {
+		if in.Intent != nil {
+			if len(in.Intent.CompanionNPCs) > 0 {
+				p += ` playerIntent.companionNPCs идут с героем: при переходе перемести их через MOVE_NPC name=@current. При отказе спутника не описывай совместный переход.`
+			}
+			switch {
+			case in.Intent.ItemRequest != "":
+				p += ` playerIntent.itemRequest — вещь, которую герой просит получить. При согласии нужен ADD_ITEM; риск: SKILL_CHECK первым, ADD_ITEM после него. actions=[] означает отказ без передачи, не обещай уже полученную вещь.`
+			case in.Intent.GiveItemID != "":
+				p += ` Герой передаёт playerIntent.giveItemId: при передаче нужен REMOVE_ITEM с этим ID. Отказ — actions=[] без передачи.`
+			case in.Intent.HeldItemID != "":
+				p += ` playerIntent.heldItemId уже у героя: не создавай вторую копию и не повторяй получение.`
+			}
+		}
 		p += ` План: максимум 4 actions; без механики actions=[]. Типы и параметры:
 ATTACK target=ID живого враждебного NPC текущей сцены, только в бою;
 SKILL_CHECK skill=strength|dexterity|constitution|intelligence|wisdom|charisma dc=5..25;
 DICE_ROLL — только самостоятельный бросок по просьбе игрока, name — dice notation (например, 1d20, 2d6+3). Для действия с характеристикой нужен SKILL_CHECK; обычное взаимодействие — actions=[].
-CREATE_NPC name description status=hostile|friendly|neutral;
+CREATE_NPC name description status=hostile|friendly|neutral threat=minor|standard|elite (сильный враг — elite);
 UPDATE_NPC target description;
+MOVE_NPC target=ID NPC name=ID или название места, @current — текущая сцена после перехода;
 SET_DISPOSITION target status=hostile|friendly|neutral (живой NPC текущей сцены);
-MOVE_SCENE name description (переход в другую локацию, вне боя);
+MOVE_SCENE name description (новое место, вне боя);
+CREATE_LOCATION name description (открыть место без перехода отряда, затем NPC может уйти туда через MOVE_NPC);
+REVISIT_SCENE target=ID из worldState.locations (известное место, вне боя);
+RECORD_LOCATION_FACT description=новый устойчивый факт текущего места;
 START_COMBAT (есть враждебный NPC); END_COMBAT (врагов не осталось);
-CREATE_QUEST name description; UPDATE_QUEST target status=FAILED (в учебном «Последнем фонаре» также COMPLETED);
+CREATE_QUEST name description; UPDATE_QUEST target status=COMPLETED только в учебном «Последнем фонаре»;
 PROPOSE_QUEST_COMPLETION target=ID активной цели description=одна конкретная причина, подтверждающая выполнение цели; только пользовательская кампания вне боя;
+PROPOSE_QUEST_FAILURE target=ID активной цели description=необратимая причина провала, подтверждённая действиями игроков; только пользовательская кампания вне боя. После одной неудачной проверки предлагай иной путь, а не провал;
 ADD_ITEM name description (сюжетный предмет действующему герою); REMOVE_ITEM target=ID предмета его инвентаря.
-За ход одна атака ИЛИ проверка ИЛИ бросок. ATTACK и SKILL_CHECK уже бросают кубики, DICE_ROLL к ним не добавляй. SKILL_CHECK идёт первым: остальные actions выполняются лишь при успехе. Наблюдение — без атаки, при необходимости SKILL_CHECK wisdom. Перемещение внутри комнаты обычно actions=[].
-Появление NPC, переход и получение предмета в тексте ОБЯЗАТЕЛЬНО отражай соответствующим action. target — только ID из worldState. Если NPC есть лишь в тексте, сначала CREATE_NPC, взаимодействие по ID — в следующем ходе. Не воскрешай NPC и не меняй завершённые квесты. Для нападения на мирного NPC сначала SET_DISPOSITION hostile и START_COMBAT. Для примирения в бою сначала SKILL_CHECK charisma, затем SET_DISPOSITION neutral. Если врагов не осталось, сервер сам закончит бой. Не начинай бой при мирном разговоре. Не требуй проверку для обычного пути или очевидной подсказки; после провала предложи другой подход к цели.
-combatOrder/combatIndex задают очередь; сервер передаёт ход сам. Прошлые броски не повторяй. Если предмет у другого героя, предложи ему выполнить действие. gmNotes и подсказки — варианты, а не обязательный маршрут: принимай разумные альтернативные действия игрока. Не закрывай цель из-за количества ходов или случайного движения и не создавай новую цель только ради продления. Если результат активной цели уже показан в текущем состоянии или действии игрока, ОБЯЗАТЕЛЬНО предложи PROPOSE_QUEST_COMPLETION с конкретной причиной. Иначе продолжай путь. Игрок подтвердит или продолжит. Пока нет подтверждения, квест и кампания активны, не пиши эпилог и не называй их завершёнными.`
+За ход одна атака ИЛИ проверка ИЛИ бросок. ATTACK и SKILL_CHECK уже бросают кубики, DICE_ROLL к ним не добавляй. SKILL_CHECK идёт первым: остальные actions выполняются лишь при успехе. Перемещение внутри комнаты обычно actions=[].
+Появление NPC, переход и получение вещи требуют action. target — ID из worldState. CREATE_NPC — новый персонаж здесь, не слухи/следы и не вещь; вещь — ADD_ITEM. Известного NPC перемещай через MOVE_NPC, не создавай повторно. Не воскрешай NPC и не меняй закрытые цели. Нападение на мирного NPC: SET_DISPOSITION hostile, START_COMBAT. Примирение в бою: SKILL_CHECK charisma, SET_DISPOSITION neutral. Сервер сам завершает бой без врагов и передаёт ход по combatOrder/combatIndex. Мирный разговор не начинает бой. Обычный путь и очевидная подсказка не требуют проверки; после провала дай иной подход.
+Предмет другого героя использует его владелец. gmNotes — зацепки, принимай разумные альтернативы. Не закрывай цель по числу ходов и не создавай новую ради продления. Если результат цели уже показан в состоянии или действии игрока, предложи PROPOSE_QUEST_COMPLETION с конкретной причиной. Иначе продолжай путь. До подтверждения игроком цель и кампания активны: без эпилога и заявлений о завершении.`
 		p += campaignPacing(in)
 		if in.Correction != nil {
 			p += ` План отклонён ДО механики. Исправь полный ответ для того же playerAction согласно planCorrection, сохрани намерение игрока. Не добавляй лишних действий.`
@@ -84,7 +117,7 @@ combatOrder/combatIndex задают очередь; сервер передаё
 			}
 		}
 		if in.State.Settings.LastLantern() {
-			p += ` Для «Последнего фонаря»: огненный камень — один конкретный предмет с точным именем «Огненный камень». Не выдавай второй камень, пока первый у отряда. Не запрашивай UPDATE_QUEST FAILED после неудачного разговора или проверки: у игроков остаются другие способы. Нельзя закрывать исходный квест словами: герой должен ранее получить камень через ADD_ITEM, вернуться в сцену у моста и установить его через REMOVE_ITEM target=ID своего камня, затем UPDATE_QUEST COMPLETED. После проверенной установки сервер завершит кампанию. Если игрок явно нападает на похитителя, сервер запускает бой; мирный разговор сам по себе боя не требует.`
+			p += ` «Последний фонарь»: одна цель, новых квестов нет. Камень у похитителя на мельнице: не передавай его новым духам или держателям в прозе. Уговор — SKILL_CHECK charisma; согласие отдать камень — SET_DISPOSITION friendly, затем ADD_ITEM с точным именем «Огненный камень». Не выдавай второй камень. Провал проверки не закрывает цель: дай иной путь. Для финала герой получает камень, возвращается к мосту, устанавливает через REMOVE_ITEM target=ID камня, затем UPDATE_QUEST COMPLETED. Сервер завершит кампанию. Нападение запускает бой, мирный разговор — нет.`
 		}
 	}
 	if in.ResponseCorrection != "" {
@@ -137,18 +170,26 @@ func (o *Ollama) GenerateTurn(ctx context.Context, model string, in Input) (Outp
 		Format   json.RawMessage     `json:"format"`
 		Messages []map[string]string `json:"messages"`
 		Options  struct {
-			NumCtx     int `json:"num_ctx"`
-			NumPredict int `json:"num_predict"`
+			NumCtx      int     `json:"num_ctx"`
+			NumPredict  int     `json:"num_predict"`
+			Temperature float64 `json:"temperature"`
 		} `json:"options"`
 	}{model, false, false, schema, []map[string]string{{"role": "system", "content": Prompt(in)}, {"role": "user", "content": string(data)}}, struct {
-		NumCtx     int `json:"num_ctx"`
-		NumPredict int `json:"num_predict"`
-	}{window, outputTokens(in)}})
+		NumCtx      int     `json:"num_ctx"`
+		NumPredict  int     `json:"num_predict"`
+		Temperature float64 `json:"temperature"`
+	}{window, outputTokens(in), 0.2}})
 	req, e := http.NewRequestWithContext(ctx, "POST", o.URL+"/api/chat", bytes.NewReader(body))
 	if e != nil {
 		return out, e
 	}
 	req.Header.Set("Content-Type", "application/json")
+	select {
+	case ollamaRequests <- struct{}{}:
+		defer func() { <-ollamaRequests }()
+	case <-ctx.Done():
+		return out, requestError(ctx.Err())
+	}
 	res, e := o.Client.Do(req)
 	if e != nil {
 		return out, requestError(e)

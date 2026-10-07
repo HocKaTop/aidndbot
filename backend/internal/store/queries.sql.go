@@ -355,6 +355,30 @@ func (q *Queries) ListRooms(ctx context.Context, userID int64) ([]Room, error) {
 	return items, nil
 }
 
+const listScenes = `-- name: ListScenes :many
+SELECT data FROM scenes WHERE room_id=$1 ORDER BY id
+`
+
+func (q *Queries) ListScenes(ctx context.Context, roomID pgtype.UUID) ([][]byte, error) {
+	rows, err := q.db.Query(ctx, listScenes, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := [][]byte{}
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		items = append(items, data)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockRoom = `-- name: LockRoom :one
 SELECT id, code, owner_id, name, status, state, created_at, updated_at FROM rooms WHERE id=$1 FOR UPDATE
 `

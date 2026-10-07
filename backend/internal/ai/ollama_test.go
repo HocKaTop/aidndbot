@@ -163,11 +163,14 @@ func TestActionSchemaTargetsExistingObjects(t *testing.T) {
 	if err := json.Unmarshal(responseSchema(Input{State: state, PlayerID: 1}), &schema); err != nil {
 		t.Fatal(err)
 	}
-	for kind, want := range map[string]string{"ATTACK": "local", "SET_DISPOSITION": "local", "REMOVE_ITEM": "owned", "UPDATE_QUEST": "active"} {
+	for kind, want := range map[string]string{"ATTACK": "local", "SET_DISPOSITION": "local", "REMOVE_ITEM": "owned", "PROPOSE_QUEST_COMPLETION": "active", "PROPOSE_QUEST_FAILURE": "active"} {
 		ids := schema.Defs[kind].Properties.Target.Enum
 		if len(ids) != 1 || ids[0] != want {
 			t.Fatalf("%s can target unavailable objects: %v", kind, ids)
 		}
+	}
+	if _, direct := schema.Defs["UPDATE_QUEST"]; direct {
+		t.Fatal("custom campaign can update quest without owner confirmation")
 	}
 	// A fresh room cannot generate references to invented objects.
 	schema.Defs = nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"dnd-bot/backend/internal/ai"
 	"dnd-bot/backend/internal/game"
+	"dnd-bot/backend/internal/store"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -54,6 +55,9 @@ func TestPrivateGMMemorySurvivesOpeningAndTurn(t *testing.T) {
 	if err != nil || len(saved.State.GMNotes) != 2 || saved.State.GMNotes[1] != "Сигнал усиливается у реактора." {
 		t.Fatal("turn memory was not persisted", err, saved.State.GMNotes)
 	}
+	if len(saved.State.PlayerHistory) != 1 || !strings.Contains(saved.State.PlayerHistory[0], "Прислушиваюсь к сигналу") {
+		t.Fatal("player decision without engine action was forgotten", saved.State.PlayerHistory)
+	}
 }
 
 func TestGMMemoryIsBoundedAndDoesNotAliasCopies(t *testing.T) {
@@ -88,5 +92,35 @@ func TestGMMemoryIsBoundedAndDoesNotAliasCopies(t *testing.T) {
 	rememberGMNotes(&state, []string{last})
 	if len(state.GMNotes) != len(clone.GMNotes) || state.GMNotes[len(state.GMNotes)-1] != last {
 		t.Fatal("repeated fact was duplicated")
+	}
+}
+
+func TestPlanningMemorySurvivesNarration(t *testing.T) {
+	ctx, server, _ := reviewServer(t)
+	room := testCampaign(t, ctx, server, 1)
+	if _, err := server.mutate(ctx, room.ID, 1, false, func(_ *store.Queries, r *Room) error {
+		r.Status = "PLAYING"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const clue = "В запасном шлюзе спрятана панель B7."
+	server.AI = openingProvider(func(_ context.Context, _ string, in ai.Input) (ai.Output, error) {
+		if in.Results == nil {
+			return ai.Output{Narrative: "Слышен тихий сигнал.", Actions: []game.Action{{Type: "SKILL_CHECK", Skill: "wisdom", DC: 12}}, Memory: []string{clue}}, nil
+		}
+		if len(in.State.GMNotes) != 1 || in.State.GMNotes[0] != clue {
+			t.Fatal("narrator did not receive planning clue", in.State.GMNotes)
+		}
+		return ai.Output{Narrative: "Сигнал слышен у панели.", Memory: []string{"Передатчик питается от запасного генератора."}}, nil
+	})
+	cmd := Command{Type: "player_action"}
+	cmd.Data.Text = "Прислушиваюсь к сигналу."
+	if err := server.command(ctx, room.ID, 1, cmd); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := server.load(ctx, room.ID, 1)
+	if err != nil || len(saved.State.GMNotes) != 2 || saved.State.GMNotes[0] != clue {
+		t.Fatal("narration erased the planning clue", saved.State.GMNotes, err)
 	}
 }

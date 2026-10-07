@@ -23,15 +23,16 @@ type Command struct {
 	ExpectedTurn *int   `json:"expectedTurn,omitempty"`
 	Type         string `json:"type"`
 	Data         struct {
-		Token    string `json:"token,omitempty"`
-		Text     string `json:"text,omitempty"`
-		Notation string `json:"notation,omitempty"`
-		ItemID   string `json:"itemId,omitempty"`
-		Ability  string `json:"ability,omitempty"`
-		Target   string `json:"target,omitempty"`
-		Ready    bool   `json:"ready,omitempty"`
-		Turn     int    `json:"turn,omitempty"`
-		Code     string `json:"code,omitempty"`
+		Token      string `json:"token,omitempty"`
+		Text       string `json:"text,omitempty"`
+		Notation   string `json:"notation,omitempty"`
+		ItemID     string `json:"itemId,omitempty"`
+		Ability    string `json:"ability,omitempty"`
+		Target     string `json:"target,omitempty"`
+		ProposalID string `json:"proposalId,omitempty"`
+		Ready      bool   `json:"ready,omitempty"`
+		Turn       int    `json:"turn,omitempty"`
+		Code       string `json:"code,omitempty"`
 	} `json:"data"`
 }
 type client struct {
@@ -264,7 +265,7 @@ func (s *Server) socket(w http.ResponseWriter, r *http.Request) {
 		}
 		last = time.Now()
 		switch cmd.Type {
-		case "player_action", "attack_npc", "roll_dice", "use_item", "class_ability", "ready", "start_game", "pass_turn", "defend_turn", "skip_turn", "finish_game", "claim_stone", "return_to_bridge", "install_stone", "confirm_quest", "continue_quest", "reopen_quest":
+		case "player_action", "attack_npc", "roll_dice", "use_item", "aid_ally", "short_rest", "class_ability", "ready", "start_game", "pass_turn", "defend_turn", "retreat", "skip_turn", "finish_game", "claim_stone", "return_to_bridge", "install_stone", "confirm_quest", "continue_quest", "reopen_quest":
 		default:
 			s.Hub.replyCommand(c, cmd, "failed", "Неизвестное событие")
 			continue

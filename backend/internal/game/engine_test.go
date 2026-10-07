@@ -41,6 +41,102 @@ func TestNegotiationRequiresCheckAndChangesOnlyLivingLocalNPC(t *testing.T) {
 	}
 }
 
+func TestReturnToKnownLocationKeepsNPCAndDescription(t *testing.T) {
+	s := NewState(Settings{})
+	s.Scene = &Scene{ID: "tavern", Title: "Таверна", Description: "У очага тепло.", Location: "Таверна"}
+	s.NPCs = []NPC{{ID: "keeper", Name: "Хозяин", Alive: true, Location: "Таверна"}}
+	if _, err := Apply(&s, 1, Action{Type: "RECORD_LOCATION_FACT", Description: "Под стойкой спрятан ключ."}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(&s, 1, Action{Type: "MOVE_SCENE", Name: "Лес", Description: "Тёмная тропа."}); err != nil {
+		t.Fatal(err)
+	}
+	if s.Present(s.NPCs[0]) || s.NPCs[0].LocationID != "tavern" {
+		t.Fatal("NPC не привязан к прежнему месту")
+	}
+	forest := s.Scene.ID
+	if ValidateAction(&s, 1, Action{Type: "MOVE_SCENE", Name: "Таверна", Description: "Другая таверна"}) == nil {
+		t.Fatal("повторное создание известного места разрешено")
+	}
+	if _, err := Apply(&s, 1, Action{Type: "REVISIT_SCENE", Target: "tavern"}); err != nil {
+		t.Fatal(err)
+	}
+	if s.Scene.ID != "tavern" || s.Scene.Description != "У очага тепло." || len(s.Scene.Facts) != 1 || s.Scene.Facts[0] != "Под стойкой спрятан ключ." || !s.Present(s.NPCs[0]) {
+		t.Fatal("возвращение не восстановило место и его NPC", s.Scene, s.NPCs[0])
+	}
+	if len(s.Scene.Exits) != 1 || s.Scene.Exits[0] != forest {
+		t.Fatal("переход между местами не сохранён", s.Scene.Exits)
+	}
+	if _, err := Apply(&s, 1, Action{Type: "MOVE_NPC", Target: "keeper", Name: forest}); err != nil {
+		t.Fatal(err)
+	}
+	if s.Present(s.NPCs[0]) || s.NPCs[0].LocationID != forest {
+		t.Fatal("NPC не переместился в выбранное место")
+	}
+}
+
+func TestNPCLeavesForNewPlaceWithoutMovingParty(t *testing.T) {
+	s := NewState(Settings{})
+	s.Scene = &Scene{ID: "hall", Title: "Зал", Location: "Зал"}
+	s.RememberLocation(*s.Scene)
+	s.NPCs = []NPC{{ID: "passenger", Name: "Пассажирка", Alive: true, Location: "Зал", LocationID: "hall"}}
+	actions := []Action{{Type: "CREATE_LOCATION", Name: "Багажное отделение", Description: "Стеклянные перегородки."}, {Type: "MOVE_NPC", Target: "passenger", Name: "Багажное отделение"}}
+	if err := ValidateActions(&s, 1, actions); err != nil || len(s.Locations) != 1 || s.NPCs[0].LocationID != "hall" {
+		t.Fatal("validation changed the world or rejected the departure", s, err)
+	}
+	if _, err := ApplyActions(&s, 1, actions); err != nil {
+		t.Fatal(err)
+	}
+	if s.Scene.ID != "hall" || len(s.Locations) != 2 || s.Present(s.NPCs[0]) || s.NPCs[0].LocationID != s.Locations[1].ID {
+		t.Fatal("NPC departure moved the party or lost its destination", s)
+	}
+	if len(s.Scene.Exits) != 1 || s.Scene.Exits[0] != s.NPCs[0].LocationID {
+		t.Fatal("discovered exit was not stored", s.Scene)
+	}
+	if _, err := ApplyActions(&s, 1, []Action{{Type: "MOVE_SCENE", Name: "Платформа"}, {Type: "MOVE_NPC", Target: "passenger", Name: "@current"}}); err != nil || !s.Present(s.NPCs[0]) {
+		t.Fatal("NPC could not accompany the party to a newly generated location", s, err)
+	}
+	if ValidateAction(&s, 1, Action{Type: "MOVE_NPC", Target: "passenger", Name: "Неизвестное место"}) == nil {
+		t.Fatal("unknown destination was accepted")
+	}
+	s.Locations = append(s.Locations, Scene{ID: "other", Title: "Багажное отделение"})
+	if s.ResolveLocation("Багажное отделение") != nil {
+		t.Fatal("ambiguous old location names were resolved silently")
+	}
+}
+
+func TestCreateNPCRejectsExistingAliasAndTutorialItem(t *testing.T) {
+	s := NewState(Settings{Name: "Последний фонарь", WorldDescription: "Тихий Брод: вернуть огненный камень."})
+	s.Scene = &Scene{ID: "bridge", Title: "Мост"}
+	s.NPCs = []NPC{{ID: "thief", Name: "Похититель", Alive: true, LocationID: "bridge"}}
+	for _, name := range []string{"Мельник-похититель", "Огненный камень"} {
+		if err := ValidateAction(&s, 1, Action{Type: "CREATE_NPC", Name: name, Status: "neutral"}); err == nil {
+			t.Fatalf("создание %q должно быть отклонено", name)
+		}
+	}
+	if err := ValidateAction(&s, 1, Action{Type: "CREATE_NPC", Name: "Стражник", Status: "neutral"}); err != nil {
+		t.Fatal(err)
+	}
+	if npcNameAlias("Страж", "Стражник") || npcNameAlias("Стражник восточный", "Стражник западный") {
+		t.Fatal("разных NPC приняли за одного")
+	}
+}
+
+func TestTutorialKeepsItsOriginalGoal(t *testing.T) {
+	s := NewState(Settings{Name: "Последний фонарь", WorldDescription: "Тихий Брод: вернуть огненный камень."})
+	goal := Action{Type: "CREATE_QUEST", Name: "Вернуть камень"}
+	if _, err := Apply(&s, 1, goal); err != nil {
+		t.Fatal("initial tutorial goal rejected", err)
+	}
+	if err := ValidateAction(&s, 1, Action{Type: "CREATE_QUEST", Name: "Смягчить сердце похитителя"}); err == nil {
+		t.Fatal("tutorial was extended with another quest")
+	}
+	s.Settings.Name = "Свободное приключение"
+	if err := ValidateAction(&s, 1, Action{Type: "CREATE_QUEST", Name: "Помочь мельнику"}); err != nil {
+		t.Fatal("custom campaign cannot add a goal", err)
+	}
+}
+
 func TestDice(t *testing.T) {
 	for _, s := range []string{"d20", "d6", "2d6", "2d6+3", "1d20+5", "1d8-1"} {
 		d, e := ParseDice(s)
@@ -163,6 +259,13 @@ func TestCampaignFinaleRequiresCompletedGoalsAndNoCombat(t *testing.T) {
 	if err := ValidateActions(&s, 1, plan); err == nil {
 		t.Fatal("AI completed custom objective without confirmation")
 	}
+	if err := ValidateActions(&s, 1, []Action{{Type: "UPDATE_QUEST", Target: "signal", Status: "FAILED"}}); err == nil {
+		t.Fatal("AI failed custom objective without confirmation")
+	}
+	failure := Action{Type: "PROPOSE_QUEST_FAILURE", Target: "signal", Description: "Передатчик уничтожен."}
+	if err := ValidateActions(&s, 1, []Action{failure}); err != nil {
+		t.Fatal(err)
+	}
 	proposal := Action{Type: "PROPOSE_QUEST_COMPLETION", Target: "signal", Description: "Передатчик включён и сигнал принят."}
 	if err := ValidateActions(&s, 1, []Action{proposal}); err != nil {
 		t.Fatal(err)
@@ -178,6 +281,37 @@ func TestCampaignFinaleRequiresCompletedGoalsAndNoCombat(t *testing.T) {
 	}
 	if err := ValidateActions(&s, 1, []Action{proposal}); err == nil {
 		t.Fatal("duplicate proposal accepted")
+	}
+	if s.PendingQuestCompletion.ID == "" || s.PendingQuestCompletion.Status != "COMPLETED" {
+		t.Fatal("proposal has no stable outcome identity")
+	}
+}
+
+func TestEnemyThreatChangesCombatValues(t *testing.T) {
+	for _, tc := range []struct {
+		threat string
+		hp     int
+		ac     int
+		bonus  int
+	}{
+		{"minor", 8, 10, 1},
+		{"standard", 12, 12, 2},
+		{"elite", 24, 14, 4},
+	} {
+		s := NewState(Settings{})
+		hero := NewCharacter(1, "Герой", "Человек", "Воин")
+		hero.HP, hero.MaxHP = 100, 100
+		s.Characters = []Character{hero}
+		s.Scene = &Scene{ID: "hall", Title: "Зал", Location: "Зал"}
+		result, err := Apply(&s, 1, Action{Type: "CREATE_NPC", Name: "Враг", Description: "Страж", Status: "hostile", Threat: tc.threat})
+		if err != nil || result.Type != "CREATE_NPC" || s.NPCs[0].HP != tc.hp || s.NPCs[0].ArmorClass != tc.ac {
+			t.Fatal(tc, result, err)
+		}
+		s.Combat = true
+		attack, err := Retaliate(&s, 1, 0)
+		if err != nil || len(attack) != 1 || attack[0].Attack.Hit != Hits(attack[0].Attack.Roll.Total, tc.bonus, hero.ArmorClass) {
+			t.Fatal("threat profile was not used for retaliation", tc, attack, err)
+		}
 	}
 }
 

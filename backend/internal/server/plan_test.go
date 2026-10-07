@@ -66,6 +66,109 @@ func TestPlanKeepsLocationUntilPlayerTravels(t *testing.T) {
 	}
 }
 
+func TestTravelIntentDistinguishesMovementFromObservationAndNegation(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		move bool
+	}{
+		{"Поднимаю камень", false},
+		{"Ищу выход", false},
+		{"Не пойду в подвал", false},
+		{"Я не хочу идти в подвал", false},
+		{"Куда идти за камнем?", false},
+		{"Спрашиваю Миру: как пройти к мельнице?", false},
+		{"Нужно ли идти к мельнице?", false},
+		{"Спрашиваю, куда идти, затем возвращаюсь к мосту", true},
+		{"Иду к двери", false},
+		{"Продолжать идти", true},
+		{"Поднимусь по лестнице", true},
+		{"Вхожу в дверь", true},
+		{"Не пойду в подвал, а вернусь к мосту", true},
+	} {
+		if got := playerIntent(tc.text).SceneChange; got != tc.move {
+			t.Errorf("%q: sceneChange=%t, want %t", tc.text, got, tc.move)
+		}
+	}
+}
+
+func TestConditionalGoalTextIsNotReportedAsVictory(t *testing.T) {
+	state := game.NewState(game.Settings{Name: "Экспедиция"})
+	state.Quests = []game.Quest{{ID: "goal", Status: "ACTIVE"}}
+	for _, text := range []string{
+		"Когда цель будет выполнена, вернитесь к мосту.",
+		"Если квест завершён, можно возвращаться.",
+		"Цель пока не выполнена.",
+	} {
+		if err := validateStoryNarrative(state, 1, nil, nil, text); err != nil {
+			t.Errorf("conditional or negative goal text rejected: %q: %v", text, err)
+		}
+	}
+	if err := validateStoryNarrative(state, 1, nil, nil, "Цель выполнена."); err == nil {
+		t.Fatal("unsupported completion was accepted")
+	}
+	if err := validateStoryNarrative(state, 1, []game.Action{{Type: "PROPOSE_QUEST_FAILURE", Target: "goal", Description: "Передатчик уничтожен."}}, nil, "Цель провалена."); err == nil {
+		t.Fatal("proposed failure was announced as confirmed")
+	}
+}
+
+func TestSceneChangeUsesStructuredIntent(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		move bool
+	}{
+		{"Поднимаю камень", false},
+		{"Ищу выход", false},
+		{"Не пойду в подвал", false},
+		{"Продолжать идти", true},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			state := game.NewState(game.Settings{})
+			state.Scene = &game.Scene{ID: "hall", Title: "Коридор", Location: "Коридор"}
+			state.Characters = []game.Character{game.NewCharacter(1, "Олег", "Человек", "Воин")}
+			calls := 0
+			s := &Server{AI: openingProvider(func(_ context.Context, _ string, in ai.Input) (ai.Output, error) {
+				calls++
+				if in.Intent == nil || in.Intent.SceneChange != tc.move {
+					t.Fatal("wrong structured travel intent", in.Intent)
+				}
+				if calls == 1 {
+					return ai.Output{Narrative: "Ты уже в подвале.", Actions: []game.Action{{Type: "MOVE_SCENE", Name: "Подвал", Description: "Темно."}}}, nil
+				}
+				if in.Correction == nil {
+					t.Fatal("missing correction for unwanted transition")
+				}
+				return ai.Output{Narrative: "Ты остаёшься в коридоре.", Actions: []game.Action{}}, nil
+			})}
+			out, err := s.planTurn(context.Background(), "room", ai.Input{State: state, PlayerID: 1, Text: tc.text})
+			wantCalls := 2
+			if tc.move {
+				wantCalls = 1
+			}
+			if err != nil || calls != wantCalls || (len(out.Actions) == 1) != tc.move {
+				t.Fatal("wrong transition decision", calls, out, err)
+			}
+		})
+	}
+}
+
+func TestDraftNarrativeDoesNotBlockActionBeforeDice(t *testing.T) {
+	state := game.NewState(game.Settings{})
+	state.Scene = &game.Scene{ID: "hall", Location: "Коридор"}
+	state.Characters = []game.Character{game.NewCharacter(1, "Олег", "Человек", "Воин")}
+	state.NPCs = []game.NPC{{ID: "guard", Name: "Стражник", HP: 100, MaxHP: 100, ArmorClass: 12, Alive: true, Disposition: "hostile", Location: "Коридор"}}
+	state.Combat = true
+	s := &Server{AI: openingProvider(func(_ context.Context, _ string, _ ai.Input) (ai.Output, error) {
+		return ai.Output{Narrative: "Стражник мёртв.", Actions: []game.Action{{Type: "ATTACK", Target: "guard"}}}, nil
+	})}
+	out, err := s.planTurn(context.Background(), "room", ai.Input{State: state, PlayerID: 1, Text: "Атакую стражника"})
+	if err != nil || len(out.Actions) != 1 {
+		t.Fatal("draft prose blocked a valid attack before dice", out, err)
+	}
+	if err := validateStoryNarrative(state, 1, out.Actions, []game.Result{}, out.Narrative); err == nil {
+		t.Fatal("same claim would be accepted as final narration without a death")
+	}
+}
+
 func TestAIRepairsAreBoundedAndInfrastructureFailuresAreNotRetried(t *testing.T) {
 	for _, failure := range []error{ai.ErrInvalidResponse, ai.ErrTimeout, ai.ErrUnavailable, ai.ErrModelUnavailable, ai.ErrBusy, ai.ErrRejected, ai.ErrContextTooLarge, context.Canceled} {
 		for _, narration := range []bool{false, true} {
@@ -127,6 +230,9 @@ func TestLastLanternNarrativeCannotInventStoneOrFinale(t *testing.T) {
 		valid     bool
 	}{
 		{"false stone transfer", "Вы принимаете сияющий камень в руки.", nil, false},
+		{"false stone transfer with adverb", "Вы бережно принимаете камень обратно в ладони.", nil, false},
+		{"false stone transfer by reference", "Похититель протягивает ладонь с камнем. Вы принимаете его дар.", nil, false},
+		{"negated stone transfer", "Вы не принимаете камень в руки.", nil, true},
 		{"real stone transfer", "Вы принимаете сияющий камень в руки.", []game.Action{{Type: "ADD_ITEM", Name: "Огненный камень"}}, true},
 		{"false finale", "Квест успешно завершён.", nil, false},
 		{"real finale", "Квест успешно завершён.", []game.Action{{Type: "UPDATE_QUEST", Target: "quest", Status: "COMPLETED"}}, true},
@@ -154,6 +260,7 @@ func TestCustomCampaignNarrativeRequiresSavedOutcomes(t *testing.T) {
 		{"unearned goal", "Цель выполнена.", nil, false},
 		{"unearned mission", "Миссия передачи сигнала завершена.", nil, false},
 		{"proposal is not completion", "Миссия передачи сигнала завершена.", []game.Action{{Type: "PROPOSE_QUEST_COMPLETION", Target: "signal", Description: "Сигнал принят."}}, false},
+		{"live model called another task finished", "Теперь главная задача по возвращению домой официально завершена.", nil, false},
 		{"earned goal", "Цель выполнена.", []game.Action{{Type: "UPDATE_QUEST", Target: "signal", Status: "COMPLETED"}}, true},
 		{"unearned campaign", "Кампания завершена.", nil, false},
 		{"goal is not finale", "Кампания завершена.", []game.Action{{Type: "UPDATE_QUEST", Target: "signal", Status: "COMPLETED"}}, false},
@@ -178,6 +285,14 @@ func TestCompletedPastQuestDoesNotValidateCurrentQuestClaim(t *testing.T) {
 	state.Quests[1].Status = "COMPLETED"
 	if err := validateStoryNarrative(state, 1, nil, []game.Result{{Type: "UPDATE_QUEST", Status: "COMPLETED"}}, "Квест завершён."); err != nil {
 		t.Fatal("new completion rejected", err)
+	}
+}
+
+func TestFailedPastQuestDoesNotValidateCurrentQuestClaim(t *testing.T) {
+	state := game.NewState(game.Settings{Name: "Экспедиция"})
+	state.Quests = []game.Quest{{ID: "old", Status: "FAILED"}, {ID: "current", Status: "ACTIVE"}}
+	if err := validateStoryNarrative(state, 1, nil, nil, "Цель провалена."); err == nil {
+		t.Fatal("past failure allowed an unconfirmed failure of the active goal")
 	}
 }
 

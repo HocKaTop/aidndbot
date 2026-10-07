@@ -25,17 +25,20 @@ const textHelp = `Можно играть прямо здесь, без Mini App
 /history — последние события
 /pass — пропустить свой ход в бою
 /defend — защищаться в бою (+2 AC против ответной атаки)
+/retreat — попытаться отступить по известному выходу
 /power, /guard — умения воина; /precise, /evade — умения плута
 /firebolt, /barrier — умения мага; после атакующего умения можно указать имя цели
 /skip — пропустить задержавшегося игрока после минуты (владелец)
 /mute и /unmute — выключить или включить уведомления выбранной кампании
 /roll d20 — бросить кубик
 /use 1 — использовать предмет по номеру из /state
+/aid Имя — поднять павшего союзника своим лечебным зельем
+/rest — отдохнуть один раз в безопасном месте
 /claim — забрать огненный камень у побеждённого или договорившегося похитителя
 /bridge — вернуться с камнем к мосту
 /install — установить камень в фонарь у моста и завершить «Последний фонарь»
-/confirm — подтвердить предложенное ведущим завершение цели (владелец)
-/continue — отклонить предложение и продолжить цель (владелец)
+/confirm КОД — подтвердить предложенный исход цели (владелец)
+/continue КОД — отклонить предложение и продолжить цель (владелец)
 /reopen — вернуть ошибочно завершённую цель в игру (владелец)
 /pause — поставить игру на паузу
 /finish — завершить кампанию и сохранить итоги (владелец, с подтверждением)
@@ -158,7 +161,7 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 	}
 	if isCommand {
 		switch command {
-		case "/play", "/pause", "/finish", "/state", "/history", "/roll", "/use", "/claim", "/bridge", "/install", "/confirm", "/continue", "/reopen", "/delete", "/ready", "/unready", "/pass", "/defend", "/power", "/guard", "/precise", "/evade", "/firebolt", "/barrier", "/skip", "/mute", "/unmute":
+		case "/play", "/pause", "/finish", "/state", "/history", "/roll", "/use", "/aid", "/rest", "/claim", "/bridge", "/install", "/confirm", "/continue", "/reopen", "/delete", "/ready", "/unready", "/pass", "/defend", "/retreat", "/power", "/guard", "/precise", "/evade", "/firebolt", "/barrier", "/skip", "/mute", "/unmute":
 		default:
 			return "Неизвестная команда. /help — список команд.", nil
 		}
@@ -275,7 +278,7 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 	case "/reopen":
 		cmd.Type = "reopen_quest"
 		for _, quest := range room.State.Quests {
-			if quest.Status == "COMPLETED" && (arg == "" || strings.EqualFold(quest.Title, arg)) {
+			if (quest.Status == "COMPLETED" || quest.Status == "FAILED") && (arg == "" || strings.EqualFold(quest.Title, arg)) {
 				if cmd.Data.Target != "" {
 					return "Укажи название цели: /reopen Название цели", nil
 				}
@@ -283,7 +286,7 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 			}
 		}
 		if cmd.Data.Target == "" {
-			return "Завершённая цель не найдена. Посмотри /state.", nil
+			return "Цель с подтверждённым исходом не найдена. Посмотри /state.", nil
 		}
 	case "/claim":
 		cmd.Type = "claim_stone"
@@ -295,6 +298,12 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		cmd.Type = "pass_turn"
 	case "/defend":
 		cmd.Type = "defend_turn"
+	case "/retreat":
+		cmd.Type = "retreat"
+		if room.State.Scene == nil || len(room.State.Scene.Exits) == 0 {
+			return "Из этой сцены пока нет известного выхода.", nil
+		}
+		cmd.Data.Target = room.State.Scene.Exits[0]
 	case "/power", "/guard", "/precise", "/evade", "/firebolt", "/barrier":
 		abilities := map[string]string{"/power": "power_strike", "/guard": "guard", "/precise": "precise_strike", "/evade": "evade", "/firebolt": "firebolt", "/barrier": "barrier"}
 		cmd.Type = "class_ability"
@@ -328,6 +337,30 @@ func (s *Server) textMessage(ctx context.Context, user auth.User, text string) (
 		}
 		cmd.Type = "use_item"
 		cmd.Data.ItemID = hero.Inventory[n-1].ID
+	case "/aid":
+		cmd.Type = "aid_ally"
+		for _, ally := range room.State.Characters {
+			if ally.UserID != user.ID && ally.HP <= 0 && strings.EqualFold(ally.Name, arg) {
+				cmd.Data.Target = ally.ID
+				break
+			}
+		}
+		if cmd.Data.Target == "" {
+			return "Укажи точное имя павшего союзника: /aid Имя.", nil
+		}
+	case "/rest":
+		cmd.Type = "short_rest"
+	}
+	if cmd.Type == "confirm_quest" || cmd.Type == "continue_quest" {
+		proposal := room.State.PendingQuestCompletion
+		if proposal == nil {
+			return "Сейчас нет предложения об исходе цели.", nil
+		}
+		code := proposal.ID[:min(8, len(proposal.ID))]
+		if arg != code && arg != proposal.ID {
+			return "Укажи код текущего предложения из /state: " + command + " " + code, nil
+		}
+		cmd.Data.ProposalID = proposal.ID
 	}
 	// Shares the engine and PostgreSQL row lock with WebSocket/REST actions.
 	if err = s.command(ctx, rid, user.ID, cmd); err != nil {
@@ -391,7 +424,8 @@ func describeRoom(r Room, user int64) string {
 		}
 	}
 	if proposal := r.State.PendingQuestCompletion; proposal != nil {
-		fmt.Fprintf(&out, "\nВедущий предлагает завершить цель: %s\nВладелец: /confirm — подтвердить, /continue — продолжить.\n", proposal.Reason)
+		code := proposal.ID[:min(8, len(proposal.ID))]
+		fmt.Fprintf(&out, "\nВедущий предлагает исход цели: %s\nВладелец: /confirm %s — подтвердить, /continue %s — продолжить.\n", proposal.Reason, code, code)
 	}
 	return out.String()
 }

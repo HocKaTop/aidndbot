@@ -42,7 +42,9 @@ func TestCustomCampaignFinaleRequiresOwnerConfirmation(t *testing.T) {
 	if err != nil || loaded.Status != "PLAYING" || loaded.State.PendingQuestCompletion == nil || loaded.State.Quests[0].Status != "ACTIVE" {
 		t.Fatal("AI proposal did not keep campaign active", loaded, err)
 	}
-	if err := s.command(ctx, r.ID, 1, Command{Type: "continue_quest", ExpectedTurn: &loaded.State.Turn}); err != nil {
+	decline := Command{Type: "continue_quest", ExpectedTurn: &loaded.State.Turn}
+	decline.Data.ProposalID = loaded.State.PendingQuestCompletion.ID
+	if err := s.command(ctx, r.ID, 1, decline); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err = s.load(ctx, r.ID, 1)
@@ -58,6 +60,7 @@ func TestCustomCampaignFinaleRequiresOwnerConfirmation(t *testing.T) {
 		t.Fatal("second proposal missing", err)
 	}
 	confirm := Command{Type: "confirm_quest", ExpectedTurn: &loaded.State.Turn}
+	confirm.Data.ProposalID = loaded.State.PendingQuestCompletion.ID
 	if err := s.command(ctx, r.ID, 1, confirm); err != nil {
 		t.Fatal(err)
 	}
@@ -96,19 +99,73 @@ func TestReopenLegacyQuestDoesNotGrantExperienceTwice(t *testing.T) {
 	if err != nil || loaded.State.Quests[0].Status != "ACTIVE" || !loaded.State.Quests[0].Rewarded || loaded.State.Characters[0].Experience != 100 {
 		t.Fatal("legacy quest not restored safely", err)
 	}
+	proposalID := uuid.NewString()
 	_, err = s.mutate(ctx, r.ID, 1, false, func(_ *store.Queries, r *Room) error {
-		r.State.PendingQuestCompletion = &game.QuestCompletionProposal{QuestID: questID, Reason: "Марков найден."}
+		r.State.PendingQuestCompletion = &game.QuestCompletionProposal{ID: proposalID, QuestID: questID, Reason: "Марков найден."}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.command(ctx, r.ID, 1, Command{Type: "confirm_quest"}); err != nil {
+	confirm := Command{Type: "confirm_quest"}
+	confirm.Data.ProposalID = proposalID
+	if err := s.command(ctx, r.ID, 1, confirm); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err = s.load(ctx, r.ID, 1)
 	if err != nil || loaded.Status != "FINISHED" || loaded.State.Characters[0].Experience != 100 {
 		t.Fatal("reopened quest granted duplicate experience", err)
+	}
+}
+
+func TestStaleQuestDecisionCannotResolveReplacementProposal(t *testing.T) {
+	ctx, s, _ := reviewServer(t)
+	r := testCampaign(t, ctx, s, 1)
+	questID, firstID, secondID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	_, err := s.mutate(ctx, r.ID, 1, false, func(_ *store.Queries, r *Room) error {
+		r.Status = "PLAYING"
+		r.State.Quests = []game.Quest{{ID: questID, Title: "Найти Маркова", Status: "ACTIVE"}}
+		r.State.PendingQuestCompletion = &game.QuestCompletionProposal{ID: firstID, QuestID: questID, Reason: "Марков найден.", Status: "COMPLETED"}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.mutate(ctx, r.ID, 1, false, func(_ *store.Queries, r *Room) error {
+		r.State.PendingQuestCompletion = &game.QuestCompletionProposal{ID: secondID, QuestID: questID, Reason: "Марков погиб.", Status: "FAILED"}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"confirm_quest", "continue_quest"} {
+		stale := Command{Type: kind}
+		stale.Data.ProposalID = firstID
+		if err := s.command(ctx, r.ID, 1, stale); err == nil {
+			t.Fatalf("stale %s changed a replacement proposal", kind)
+		}
+	}
+	loaded, err := s.load(ctx, r.ID, 1)
+	if err != nil || loaded.State.PendingQuestCompletion == nil || loaded.State.PendingQuestCompletion.ID != secondID || loaded.State.Quests[0].Status != "ACTIVE" {
+		t.Fatal("stale command changed quest", err)
+	}
+	confirm := Command{Type: "confirm_quest"}
+	confirm.Data.ProposalID = secondID
+	if err := s.command(ctx, r.ID, 1, confirm); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.load(ctx, r.ID, 1)
+	if err != nil || loaded.State.Quests[0].Status != "FAILED" || loaded.Status != "PLAYING" || loaded.State.Characters[0].Experience != 0 {
+		t.Fatal("failed outcome was not saved correctly", err)
+	}
+	reopen := Command{Type: "reopen_quest"}
+	reopen.Data.Target = questID
+	if err := s.command(ctx, r.ID, 1, reopen); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.load(ctx, r.ID, 1)
+	if err != nil || loaded.State.Quests[0].Status != "ACTIVE" || loaded.State.Quests[0].Rewarded {
+		t.Fatal("failed quest could not be restored", err)
 	}
 }
 

@@ -38,6 +38,8 @@ INSERT INTO npcs(id,room_id,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET
 INSERT INTO quests(id,room_id,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data;
 -- name: SaveScene :exec
 INSERT INTO scenes(id,room_id,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data;
+-- name: ListScenes :many
+SELECT data FROM scenes WHERE room_id=$1 ORDER BY id;
 -- name: ClearInventory :exec
 DELETE FROM inventory_items WHERE character_id=$1;
 -- name: SaveItem :exec

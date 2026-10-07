@@ -120,7 +120,15 @@ func TestAdventureFromCreationToCompletedGoalAndFinale(t *testing.T) {
 		case "Договариваюсь и забираю камень":
 			out.Actions = []game.Action{{Type: "SET_DISPOSITION", Target: in.State.NPCs[0].ID, Status: "friendly"}, {Type: "ADD_ITEM", Name: "Огненный камень"}}
 		case "Возвращаемся к мосту":
-			out.Actions = []game.Action{{Type: "MOVE_SCENE", Name: "Мост", Description: "Мира ждёт возвращения света."}}
+			for _, place := range in.State.Locations {
+				if place.Title == "Мост" {
+					out.Actions = []game.Action{{Type: "REVISIT_SCENE", Target: place.ID}}
+					break
+				}
+			}
+			if len(out.Actions) == 0 {
+				return ai.Output{}, fmt.Errorf("known bridge was not saved")
+			}
 		case "Устанавливаю камень в фонарь":
 			for _, item := range in.State.Hero(in.PlayerID).Inventory {
 				if item.Name == "Огненный камень" {
@@ -159,6 +167,7 @@ func TestAdventureFromCreationToCompletedGoalAndFinale(t *testing.T) {
 		}
 	}
 	finish := Command{Type: "confirm_quest", ExpectedTurn: &r.State.Turn}
+	finish.Data.ProposalID = r.State.PendingQuestCompletion.ID
 	command(2, finish, "failed")
 	command(1, finish, "completed")
 	if r.Status != "FINISHED" || r.State.Ending == nil {

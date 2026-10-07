@@ -48,7 +48,7 @@ func (s *Server) command(ctx context.Context, rid string, user int64, cmd Comman
 			return bad("Игра ещё не началась или на паузе")
 		}
 		if cmd.Type == "confirm_quest" || cmd.Type == "continue_quest" {
-			return s.resolveQuestProposal(ctx, q, r, user, cmd.Type)
+			return s.resolveQuestProposal(ctx, q, r, user, cmd.Type, cmd.Data.ProposalID)
 		}
 		if cmd.Type == "reopen_quest" {
 			return s.reopenQuest(ctx, q, r, user, cmd.Data.Target)
@@ -70,6 +70,48 @@ func (s *Server) command(ctx context.Context, rid string, user int64, cmd Comman
 			}
 		}
 		switch cmd.Type {
+		case "short_rest":
+			result, err := game.ShortRest(&r.State, user)
+			if err != nil {
+				return bad(err.Error())
+			}
+			rememberTurn(&r.State, []game.Result{result})
+			return s.addEvent(ctx, q, rid, user, result.Type, result)
+		case "aid_ally":
+			result, err := game.AidAlly(&r.State, user, cmd.Data.Target)
+			if err != nil {
+				return bad(err.Error())
+			}
+			results, err := settleTurn(r, user, r.State.Combat, []game.Result{result})
+			if err != nil {
+				return err
+			}
+			rememberTurn(&r.State, results)
+			for _, result := range results {
+				if err := s.addEvent(ctx, q, rid, user, result.Type, result); err != nil {
+					return err
+				}
+			}
+			return nil
+		case "retreat":
+			result, err := game.Retreat(&r.State, user, cmd.Data.Target)
+			if err != nil {
+				return bad(err.Error())
+			}
+			results, err := settleTurn(r, user, true, []game.Result{result})
+			if err != nil {
+				return err
+			}
+			rememberTurn(&r.State, results)
+			if err := s.addEvent(ctx, q, rid, user, "PLAYER_ACTION", game.Result{Type: "PLAYER_ACTION", Text: hero.Name + " пытается отступить."}); err != nil {
+				return err
+			}
+			for _, result := range results {
+				if err := s.addEvent(ctx, q, rid, user, result.Type, result); err != nil {
+					return err
+				}
+			}
+			return nil
 		case "claim_stone", "return_to_bridge", "install_stone":
 			return s.lanternCommand(ctx, q, r, user, cmd.Type)
 		case "pass_turn":
@@ -176,14 +218,26 @@ func (s *Server) command(ctx context.Context, rid string, user int64, cmd Comman
 			for _, v := range events[start:] {
 				recent = append(recent, string(v.Payload))
 			}
-			input := ai.Input{State: r.State, Recent: recent, PlayerID: user, Text: text}
+			intent, err := turnIntent(r.State, user, text)
+			if err != nil {
+				return err
+			}
+			beforeState := r.State.Clone()
+			input := ai.Input{State: r.State, BeforeState: &beforeState, Recent: recent, PlayerID: user, Text: text, Intent: &intent}
 			wasCombat := r.State.Combat
 			results, explicitAttack, e := applyExplicitAttack(&r.State, user, text)
 			if e != nil {
 				return e
 			}
 			var out ai.Output
+			lanternIntent := false
 			if !explicitAttack {
+				results, lanternIntent, e = applyLanternIntent(&r.State, user, text)
+				if e != nil {
+					return e
+				}
+			}
+			if !explicitAttack && !lanternIntent {
 				out, e = s.planTurn(ctx, rid, input)
 				if e != nil {
 					return e
@@ -205,15 +259,26 @@ func (s *Server) command(ctx context.Context, rid string, user int64, cmd Comman
 			}
 			if explicitAttack {
 				out.Narrative = combatNarrative(results)
+			} else if lanternIntent && len(results) == 1 && results[0].Type == "ITEM_ALREADY_HELD" {
+				out.Narrative = results[0].Text
 			} else if len(results) > 0 {
-				input.State = r.State
+				input.State = r.State.Clone()
+				rememberGMNotes(&input.State, out.Memory)
 				input.Results = results
-				narration, e := s.narrateTurn(ctx, rid, input)
-				if e != nil {
-					return e
+				narrationCtx, stopNarration := narrationContext(ctx)
+				narration, narrationErr := s.narrateTurn(narrationCtx, rid, input)
+				stopNarration()
+				if narrationErr != nil {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					slog.Warn("AI narration replaced with engine results", "room", rid, "error", narrationErr)
+					out.Narrative = resultNarrative(results)
+					out.Memory = nil
+				} else {
+					out.Narrative = narration.Narrative
+					out.Memory = append(out.Memory, narration.Memory...)
 				}
-				out.Narrative = narration.Narrative
-				out.Memory = narration.Memory
 			}
 			if strings.TrimSpace(out.Narrative) == "" {
 				return bad("Модель вернула пустое повествование. Ход не сохранён.")
@@ -230,6 +295,7 @@ func (s *Server) command(ctx context.Context, rid string, user int64, cmd Comman
 				return e
 			}
 			rememberTurn(&r.State, results)
+			rememberPlayerAction(&r.State, hero.Name, text)
 			rememberGMNotes(&r.State, out.Memory)
 			return nil
 		}
@@ -238,13 +304,16 @@ func (s *Server) command(ctx context.Context, rid string, user int64, cmd Comman
 	return e
 }
 
-func (s *Server) resolveQuestProposal(ctx context.Context, q *store.Queries, r *Room, user int64, kind string) error {
+func (s *Server) resolveQuestProposal(ctx context.Context, q *store.Queries, r *Room, user int64, kind, proposalID string) error {
 	if !CanManage(r.OwnerID, user) {
 		return denied()
 	}
 	proposal := r.State.PendingQuestCompletion
 	if proposal == nil {
 		return bad("Предложение завершить цель уже неактуально")
+	}
+	if proposalID == "" || proposal.ID != proposalID {
+		return bad("Предложение изменилось. Посмотри актуальное решение об итоге.")
 	}
 	if kind == "continue_quest" {
 		r.State.PendingQuestCompletion = nil
@@ -263,10 +332,17 @@ func (s *Server) resolveQuestProposal(ctx context.Context, q *store.Queries, r *
 	if index < 0 {
 		return bad("Эта цель уже неактуальна")
 	}
-	r.State.Quests[index].Status = "COMPLETED"
+	status := proposal.Status
+	if status == "" { // Proposals saved before outcome status existed were for completion.
+		status = "COMPLETED"
+	}
+	if status != "COMPLETED" && status != "FAILED" {
+		return bad("Некорректный исход цели")
+	}
+	r.State.Quests[index].Status = status
 	r.State.PendingQuestCompletion = nil
-	results := []game.Result{{Type: "UPDATE_QUEST", Status: "COMPLETED", Text: "Цель «" + r.State.Quests[index].Title + "» подтверждена: " + proposal.Reason}}
-	if !r.State.Quests[index].Rewarded {
+	results := []game.Result{{Type: "UPDATE_QUEST", Status: status, Text: "Исход цели «" + r.State.Quests[index].Title + "» подтверждён: " + proposal.Reason}}
+	if status == "COMPLETED" && !r.State.Quests[index].Rewarded {
 		results = append(results, game.AwardProgress(&r.State, results)...)
 		r.State.Quests[index].Rewarded = true
 	}
@@ -294,15 +370,18 @@ func (s *Server) reopenQuest(ctx context.Context, q *store.Queries, r *Room, use
 	}
 	for i := range r.State.Quests {
 		quest := &r.State.Quests[i]
-		if quest.ID != target || quest.Status != "COMPLETED" {
+		if quest.ID != target || (quest.Status != "COMPLETED" && quest.Status != "FAILED") {
 			continue
 		}
+		wasCompleted := quest.Status == "COMPLETED"
 		quest.Status = "ACTIVE"
-		quest.Rewarded = true // Старый финал уже выдал опыт; повторно его не начисляем.
+		if wasCompleted {
+			quest.Rewarded = true // Старый финал уже выдал опыт; повторно его не начисляем.
+		}
 		r.State.PendingQuestCompletion = nil
 		return s.addEvent(ctx, q, r.ID, user, "QUEST_REOPENED", game.Result{Type: "QUEST_REOPENED", Text: "Цель «" + quest.Title + "» возвращена в игру по решению владельца."})
 	}
-	return bad("Завершённая цель не найдена")
+	return bad("Цель с подтверждённым исходом не найдена")
 }
 
 func settleTurn(r *Room, user int64, wasCombat bool, results []game.Result) ([]game.Result, error) {
@@ -405,4 +484,47 @@ func rememberTurn(state *game.State, results []game.Result) {
 	if len(runes) > 6000 {
 		state.Summary = string(runes[len(runes)-6000:])
 	}
+}
+
+// A confirmed player action is kept separately from engine facts. The action
+// expresses intent; the world changed only where the engine produced results.
+func rememberPlayerAction(state *game.State, hero, action string) {
+	entry := fmt.Sprintf("Ход %d, %s попытался: %s", state.Turn, hero, strings.TrimSpace(action))
+	state.PlayerHistory = append(state.PlayerHistory, entry)
+	bytes := 0
+	for _, item := range state.PlayerHistory {
+		bytes += len(item)
+	}
+	for len(state.PlayerHistory) > 24 || bytes > 4000 {
+		bytes -= len(state.PlayerHistory[0])
+		state.PlayerHistory = state.PlayerHistory[1:]
+	}
+}
+
+func resultNarrative(results []game.Result) string {
+	parts := make([]string, 0, len(results))
+	for _, result := range results {
+		if result.Text != "" {
+			parts = append(parts, result.Text)
+		}
+	}
+	message := "Результат хода: " + strings.Join(parts, " ")
+	runes := []rune(message)
+	if len(runes) > 900 {
+		message = string(runes[:897]) + "…"
+	}
+	return message
+}
+
+// Stop narration before the command deadline so engine results and the command
+// receipt can still be committed when the model runs out of time.
+func narrationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(45 * time.Second)
+	if commandDeadline, ok := ctx.Deadline(); ok {
+		saveDeadline := commandDeadline.Add(-5 * time.Second)
+		if saveDeadline.Before(deadline) {
+			deadline = saveDeadline
+		}
+	}
+	return context.WithDeadline(ctx, deadline)
 }
