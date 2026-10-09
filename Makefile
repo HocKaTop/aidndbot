@@ -1,23 +1,28 @@
 .PHONY: up down test generate frontend tunnel tunnel-down tunnel-logs
+COMPOSE = docker compose -f docker-compose.yml
+ifeq ($(shell uname -s),Darwin)
+COMPOSE += -f compose.mac.yml
+endif
+
 up:
-	docker compose up -d --build
+	$(COMPOSE) up -d --build
 
 down:
-	docker compose down
+	$(COMPOSE) down
 
 tunnel:
 	python3 scripts/start_tunnel.py
 
 tunnel-down:
-	docker compose -f docker-compose.yml -f compose.tunnel.yml stop tunnel
+	$(COMPOSE) -f compose.tunnel.yml stop tunnel
 
 tunnel-logs:
-	docker compose -f docker-compose.yml -f compose.tunnel.yml logs -f tunnel
+	$(COMPOSE) -f compose.tunnel.yml logs -f tunnel
 
 test:
 	cd backend && go test ./... && go vet ./...
 	cd frontend && npm run build
-	docker compose -f docker-compose.yml -f compose.test.yml run --build --rm tests
+	$(COMPOSE) -f compose.test.yml run --build --rm tests
 
 generate:
 	cd backend && sqlc generate

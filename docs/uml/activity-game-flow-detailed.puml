@@ -1,0 +1,186 @@
+@startuml
+' Sources: backend/internal/server/{rooms,text,opening,turn,ending,lantern,plan}.go;
+' backend/internal/game/{engine,state,turn_order,progression}.go; frontend/src/App.tsx.
+title Игровой цикл кампании
+skinparam shadowing false
+skinparam wrapWidth 260
+
+start
+:Открыть Telegram-бот или Mini App;
+:Получить личность из Bot API\nили проверить Telegram initData и выдать сессию;
+
+if (Создать новую комнату?) then (да)
+  :createCampaign → WAITING;\nсохранить настройки, код и владельца-участника;
+  note right
+    /create автоматически создаёт героя
+    и выбирает bot_sessions.room_id.
+    Mini App создаёт героя отдельным запросом.
+  end note
+else (нет)
+  if (Уже участник комнаты?) then (да)
+    :Загрузить свою комнату;\nв боте выбрать её через /room КОД;
+  else (нет)
+    :Ввести код / открыть приглашение;
+    if (Комната WAITING и есть свободное место?) then (да)
+      :Добавить участника;\n/join также создаёт героя и выбирает комнату;
+    else (нет)
+      :Отказать во входе;
+      stop
+    endif
+  endif
+endif
+
+if (Status = WAITING?) then (да)
+  repeat
+    :Создать / отредактировать героя;\nнастроить мир до старта;\nкаждый участник подтверждает Ready;
+    :Владелец запрашивает старт\nPOST /api/rooms/{id}/start, start_game WS или /play;
+    if (Все участники готовы и имеют живого героя?) then (да)
+      :startGame → mutate → openAdventure;\nLLM планирует вступление;
+      :Проверить план и текст;\nдо одной попытки исправления;
+      if (Вступление корректно?) then (да)
+        :ApplyActions: начальная Scene, одна Quest,\nдо двух мирных NPC; сохранить GMNotes;
+        :PLAYING; события GAME_STARTED + GM_MESSAGE;\nсохранить состояние и COMMIT;
+        note right
+          Ошибка любого этапа запуска → ROLLBACK:
+          комната остаётся WAITING.
+          Вступление не расходует игровой ход.
+        end note
+      else (нет)
+        :ROLLBACK; показать ошибку;\nсохранённое лобби остаётся WAITING;
+      endif
+    else (нет)
+      :Остаться в лобби; показать, кого ждём;
+    endif
+  repeat while (Status = WAITING?) is (да) not (нет)
+endif
+
+while (Status != FINISHED?) is (да)
+  if (Status = PAUSED?) then (да)
+    :Игровые действия недоступны;\nисторию и состояние можно читать;
+    :Дождаться решения владельца;
+    if (Продолжить игру?) then (да)
+      :startGame → PLAYING; GAME_RESUMED;\nсохранить прежнюю сцену и очередь боя;
+      note right
+        После паузы LLM-вступление
+        повторно не создаётся.
+      end note
+    else (завершить)
+      :finishCampaign: проверить владельца\nи подтверждение кодом комнаты;
+      if (Подтверждение корректно?) then (да)
+        :endCampaign(reason=owner);\nсохранить FINISHED, Ending и GAME_FINISHED;
+      else (нет)
+        :Показать ошибку; оставить PAUSED;
+      endif
+    endif
+  else (PLAYING)
+    :Получить команду из Telegram / WebSocket\nили запрос управления комнатой через REST;
+    if (Владелец запрашивает паузу?) then (да)
+      :mutate: PAUSED + GAME_PAUSED;\nсохранить состояние;
+    elseif (Запрошено ручное завершение?) then (да)
+      :finishCampaign: проверить владельца\nи подтверждение кодом комнаты;
+      if (Подтверждение корректно?) then (да)
+        :endCampaign(reason=owner);\nсохранить FINISHED, Ending и GAME_FINISHED;
+      else (нет)
+        :Показать ошибку; оставить PLAYING;
+      endif
+    else (игровая команда)
+      :mutate: BEGIN; FOR UPDATE NOWAIT;\nзагрузить State и участников;
+      if (Уже сохранён receipt этой WS-команды?) then (да)
+        :Вернуть подтверждённые события / статус;\nзавершить чтение без повторного выполнения;
+      else (нет)
+        if (Команда допустима?) then (да)
+          note right
+            Проверяются статус, членство, права команды,
+            живой герой и очередь боя (где требуются).
+            Для WS: command_receipts исключает повтор;
+            expectedTurn отклоняет устаревшее действие.
+            Занятая комната → ROOM_BUSY.
+          end note
+          if (Подтвердить / отклонить завершение цели?) then (да)
+            :resolveQuestProposal — только владелец;
+            if (Владелец подтверждает допустимую цель?) then (да)
+              :Quest.Status = COMPLETED;\nвыдать опыт один раз; очистить предложение;
+              if (Все цели COMPLETED?) then (да)
+                :endCampaign(reason=objective);
+              endif
+            else (продолжить)
+              :Очистить предложение; цель остаётся ACTIVE;
+            endif
+          elseif (reopen_quest / roll_dice?) then (да)
+            :Вернуть завершённую цель в ACTIVE\n(владелец, пользовательская кампания, вне боя)\nили выполнить самостоятельный бросок;
+            note right
+              Эти команды не вызывают LLM,
+              settleTurn и rememberTurn.
+            end note
+          else (обычный ход)
+            if (Текстовое player_action?) then (да)
+              if (Явная атака?) then (да)
+                :applyExplicitAttack → game.ApplyActions;\nбоевые изменения и броски без LLM;
+              else (нет)
+                :Загрузить недавние события;\nplanTurn → LLM: состояние, память, действие;
+                :Проверить план и narrative;\nмаксимум одно исправление до бросков;
+                :game.ApplyActions;\nрассчитать проверки, применить изменения;
+              endif
+              :ensureLanternThief для «Последнего фонаря»\nпри необходимости;
+            else (механическая команда)
+              :Атака / предмет / классовая способность /\nзащита / пропуск / сценарные команды фонаря;
+              note right
+                В бою действует текущий герой.
+                Владелец может /skip после минуты ожидания;
+                самостоятельно пропустить / защититься может игрок.
+              end note
+            endif
+            :settleTurn: инициатива при начале боя;\nRetaliate — ответ одного противника;\nопыт / уровни и проверка финала;
+            if (Весь отряд погиб?) then (да)
+              :endCampaign(reason=defeat);
+            elseif (Проверенный финал «Последнего фонаря»?) then (да)
+              :endCampaign(reason=objective);
+              note right
+                Камень получен у похитителя,
+                возвращён к мосту и установлен;
+                REMOVE_ITEM + UPDATE_QUEST COMPLETED.
+              end note
+            endif
+            :Завершение settleTurn: AdvanceCombatTurn;\nпередать ход следующему живому герою\nили очистить очередь завершённого боя;
+            if (Текстовый ход с LLM и есть результаты?) then (да)
+              :narrateTurn → LLM описывает engineResults;\nactions=[]; максимум одно исправление;
+            else (нет)
+              :Использовать текст первого AI-ответа,\ncombatNarrative или результаты команды;
+            endif
+            :Добавить события хода;\nrememberTurn: Turn++ и Summary;\nсохранить GMNotes из AI-ответа, если он есть;
+          endif
+
+          if (Все этапы команды успешны?) then (да)
+            :persist: State + сущности + Summary;\nзаписать события, outbox и WS receipt; COMMIT;
+            :Ответить автору; сигнал refresh для Mini App;\nотправить уведомления подписчикам;
+            note right
+              PROPOSE_QUEST_COMPLETION сохраняет предложение:
+              цель остаётся ACTIVE до решения владельца.
+              Новое обычное действие снимает предложение
+              и продолжает приключение.
+            end note
+          else (ошибка)
+            :ROLLBACK; показать причину;\nсохранённый мир и ход остаются прежними;
+          endif
+          note left
+            При ошибке выполнение немедленно прекращается
+            и переходит к ROLLBACK, включая ошибки LLM,
+            правил, сохранения и подтверждения цели.
+          end note
+        else (нет)
+          :ROLLBACK; показать ошибку;
+        endif
+      endif
+    endif
+  endif
+endwhile (нет)
+
+:FINISHED: Ending, герои, квесты и история сохранены;\nдоступны итоги и чтение журнала;
+note right
+  Возобновление FINISHED запрещено.
+  Ручной финал не расходует ход и не меняет
+  статусы квестов или героев на победные.
+  Для следующей игры создаётся новая кампания.
+end note
+stop
+@enduml

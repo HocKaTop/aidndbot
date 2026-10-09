@@ -1,0 +1,131 @@
+@startuml
+' Sources: backend/internal/bot/bot.go; backend/internal/server/{text,turn,rooms,plan,activity,socket}.go;
+' backend/internal/ai/ollama.go; backend/internal/game/engine.go; backend/internal/notifications/outbox.go.
+' Flowchart representation: the original messages, decisions and notes are preserved.
+title Один текстовый ход через Telegram Bot
+skinparam shadowing false
+skinparam defaultFontSize 13
+skinparam activityDiamondFontSize 12
+skinparam wrapWidth 320
+
+start
+floating note right
+  Предусловия: выбранная комната PLAYING, игрок — участник с живым героем.
+  Показан обычный текст (Command.Type = player_action).
+  Bot и доставка уведомлений запущены при BOT_ENABLED=true.
+end note
+:**Игрок → bot.Bot**\nличное сообщение через Telegram Bot API;
+:**bot.Bot**\nRun: getUpdates → очередь чата\nchatWorkers.run, общий timeout 150 s;
+:**bot.Bot → Игрок**\nsendChatAction("typing") через Telegram;
+:**bot.Bot → server.Server**\nHandle(ctx, auth.User, text)\n= Server.TextMessage;
+:**server.Server → PostgreSQL**\nUpsertUser; GetBotRoom(user.ID)\nGetRoom + ListMembers (load)\n**PostgreSQL → server.Server**\nвыбранная комната + State + участники;
+:**server.Server**\ncommand(player_action) → mutate;
+:**server.Server → PostgreSQL**\nBEGIN; LockRoomNowait\nSELECT ... FOR UPDATE NOWAIT;
+if (комната уже заблокирована?) then (да)
+  :**PostgreSQL → server.Server**\nSQLSTATE 55P03 → ROOM_BUSY;
+  :**server.Server → PostgreSQL**\nROLLBACK;
+  :**server.Server → bot.Bot**\nсообщение «Дождись ответа мастера»;
+  :**bot.Bot → Игрок**\nBot.Send → sendMessage;
+else (блокировка получена)
+  :**PostgreSQL → server.Server**\nrooms.state (JSONB) + ListMembers;
+  :**server.Server → server.Hub**\nbeginActivity(room, user, kind);
+  :**server.Hub → Mini App**\nroom_activity {processing: true};
+  :**server.Server → PostgreSQL**\nListEvents: события до изменения\n+ последние события для AI\n**PostgreSQL → server.Server**\nпоследние 100 событий; в AI идут до 20;
+  :**server.Server**\nпроверить членство, статус, живого героя,\nбоевую очередь и текст 1–1000 символов;
+  partition "Выполнение внутри открытой транзакции и блокировки комнаты" {
+    :**server.Server**\napplyExplicitAttack(State, user, text);
+    if (распознана явная атака с допустимой целью?) then (да)
+      :**server.Server → internal/game**\nApplyActions: отношение / начало боя / ATTACK\n**internal/game → server.Server**\nизменённый State + результаты атаки;
+    else (обычное сюжетное действие)
+      :**server.Server → AI Game Master**\nplanTurn(State, Recent, PlayerID, Text);
+      :**AI Game Master → ai.Ollama**\nProvider.GenerateTurn(model, input);
+      :**ai.Ollama**\nprepareInput / Prompt / responseSchema;
+      :**ai.Ollama → Ollama server**\nPOST /api/chat\nсостояние, память, события, действие + JSON Schema\n**Ollama server → ai.Ollama**\nJSON: actions / narrative / memory;
+      :**ai.Ollama**\nстрогая проверка JSON, полей и лимитов;
+      :**ai.Ollama → AI Game Master**\nai.Output;
+      :**AI Game Master → internal/game**\nValidateActions на копии состояния\nбез бросков\n**internal/game → AI Game Master**\nрезультат проверки;
+      :**AI Game Master**\nпроверить соответствие повествования\nи разрешённость перехода сцены;
+      note right
+        Некорректный план/формат: максимум одно исправление до механики.
+        Таймаут и инфраструктурная ошибка не повторяются автоматически.
+      end note
+      :**AI Game Master → server.Server**\nвалидный план;
+      :**server.Server → internal/game**\nApplyActions(&State, user, actions)\n**internal/game → server.Server**\nчисловые результаты + изменения мира;
+    endif
+    :**server.Server**\nensureLanternThief при необходимости\nsettleTurn(room, user, results);
+    :**server.Server → internal/game**\nинициатива / Retaliate / AwardProgress\n**internal/game → server.Server**\nитоговые результаты + State;
+    :**server.Server**\nпри поражении / проверенном финале:\nendCampaign → FINISHED + Ending;
+    :**server.Server → internal/game**\nAdvanceCombatTurn\nсбросить очередь, если бой завершён\n**internal/game → server.Server**\nследующий живой герой; TURN_CHANGED при активном бое;
+    if (явная атака?) then (да)
+      :**server.Server**\ncombatNarrative(results)\nповествование без LLM;
+    elseif (есть результаты механики или settleTurn?) then (да)
+      :**server.Server → AI Game Master**\nnarrateTurn(обновлённый State, Results);
+      :**AI Game Master → ai.Ollama**\nProvider.GenerateTurn(model, input);
+      :**ai.Ollama → Ollama server**\nPOST /api/chat с engineResults\nмеханика уже рассчитана\n**Ollama server → ai.Ollama**\nJSON: narrative / memory / actions=[];
+      :**ai.Ollama → AI Game Master**\nпроверенный ai.Output;
+      :**AI Game Master**\nвалидация текста; максимум одно исправление;
+      note right
+        Исправление повествования использует те же результаты:
+        движок и броски повторно не выполняются.
+      end note
+      :**AI Game Master → server.Server**\nокончательное повествование + память;
+    else (результатов нет)
+      :**server.Server**\nиспользовать narrative / memory первого ответа;
+    endif
+    :**server.Server → PostgreSQL**\nAddEvent: PLAYER_ACTION, результаты, GM_MESSAGE;
+    :**server.Server**\nrememberTurn: Turn++, Summary\nrememberGMNotes: приватная память;
+    :**server.Server → PostgreSQL**\npersist: SaveRoom(State, Status), SaveCharacter,\nClearInventory / SaveItem, SaveNPC, SaveQuest,\nSaveScene, SaveSummary; ListEvents после изменения;
+    :**server.Server → PostgreSQL**\nINSERT telegram_outbox для подписчиков,\nкроме автора Telegram-команды;
+  }
+  if (любой этап вернул ошибку / timeout?) then (да)
+    note right
+      При ошибке выполнение сразу прекращается;
+      последующие шаги группы не выполняются.
+    end note
+    :**server.Server → PostgreSQL**\nROLLBACK: состояние, события и outbox вместе;
+    :**server.Server → server.Hub**\nзавершить активность;
+    :**server.Hub → Mini App**\nroom_activity {processing: false};
+    :**server.Server → bot.Bot**\nпонятное сообщение об ошибке; ход не сохранён;
+    :**bot.Bot → Игрок**\nBot.Send → sendMessage;
+  else (все этапы успешны)
+    :**server.Server → PostgreSQL**\nCOMMIT;
+    :**server.Server**\nreceipt.Events = новые события;
+    :**server.Server → server.Hub**\nзавершить активность; Publish("room_state");
+    :**server.Hub → Mini App**\nroom_activity {processing: false}\nroom_state {refresh: true};
+    :**Mini App → server.Server**\nGET /api/rooms/{id}\nGET /api/rooms/{id}/events/page;
+    :**server.Server → PostgreSQL**\nчтение подтверждённой комнаты и журнала\n**PostgreSQL → server.Server**\nсохранённые данные;
+    :**server.Server → Mini App**\nкомната без GMNotes + события;
+    :**server.Server → bot.Bot**\nrenderTextEvents(receipt.Events);
+    :**bot.Bot → Игрок**\nBot.Send → sendMessage\nрезультаты + ответ ведущего;
+    if (другие подписчики выбранной кампании?) then (да)
+      :**notifications → PostgreSQL**\nпрочитать committed telegram_outbox\nFOR UPDATE SKIP LOCKED; проверить подписку\n**PostgreSQL → notifications**\nполучатель + текст;
+      :**notifications → bot.Bot**\nBot.Send(recipient, body);
+      :**bot.Bot**\nsendMessage другим игрокам через Telegram;
+      :**notifications → PostgreSQL**\nудалить доставленную запись / назначить повтор;
+    else (нет)
+    endif
+  endif
+endif
+
+stop
+
+legend bottom
+  AI Game Master — логическая роль функций Server, отдельного объекта нет.
+  Telegram-команды идут напрямую в command; очередь Hub обслуживает только WebSocket.
+  Для Mini App вход: player_action с id и expectedTurn → socket → Hub.submit → Hub.run → command.
+  mutate проверяет command_receipts до выполнения и сохраняет подтверждение в той же транзакции;
+  Hub возвращает command_status, а содержимое хода Mini App получает через REST после refresh.
+  Обычный текстовый Telegram-ход не имеет command id и не создаёт command_receipts.
+
+  Участники и роли:
+  bot.Bot · Run / chatWorkers / Send
+  server.Server · TextMessage / command / mutate
+  AI Game Master · методы того же Server: · planTurn / narrateTurn
+  internal/game · функции и game.State
+  ai.Ollama · реализация ai.Provider
+  Ollama server · LLM
+  PostgreSQL · через store.Queries / pgx
+  Mini App · подключённые участники
+  notifications · Run / DeliverOne
+endlegend
+@enduml

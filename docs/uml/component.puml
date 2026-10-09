@@ -1,0 +1,50 @@
+@startuml
+' Sources: backend/cmd/server/main.go; backend/internal/{bot,server,game,ai,auth,store,notifications};
+' frontend/src; frontend/nginx.conf.
+title Компоненты приложения
+left to right direction
+skinparam componentStyle uml2
+skinparam shadowing false
+skinparam defaultFontSize 13
+skinparam nodesep 25
+skinparam ranksep 35
+
+component "Telegram Mini App\nReact / TypeScript" as mini
+component "nginx\nReverse Proxy" as proxy
+cloud "Telegram Bot API" as telegram
+
+package "Application Backend · Go" {
+  component "Telegram Bot\n(bot)" as bot
+  component "Server\n(server.Server)" as server
+  component "Room Runtime /\nWebSocket Hub\n(server.Hub)" as hub
+  component "Authentication\n(auth)" as auth
+  component "Game Logic\n(game)" as game
+  component "AI Game Master\n(server + ai)" as gm
+  component "LLM Client\n(ai.Provider / ai.Ollama)" as client
+  component "Storage / Repository\n(store + pgx)" as repository
+  component "Notifications\n(notifications)" as notifications
+}
+cloud "Ollama / LLM" as llm
+database "PostgreSQL" as database
+
+mini --> proxy : HTTP / WebSocket
+proxy --> server : HTTP / WebSocket
+bot -left-> telegram : Telegram Bot API
+bot --> server : сообщение
+server <-up-> hub : команды / события
+server -down-> auth : аутентификация
+server --> game : правила
+server --> gm : план / текст
+gm -down-> game : проверка плана
+gm --> client : генерация
+client --> llm : LLM HTTP API
+server --> repository : данные
+repository --> database : SQL
+notifications --> database : SQL · уведомления
+notifications -up-> bot : доставка
+
+legend bottom
+  Server координирует игровые правила, AI и сохранение.
+  AI Game Master — логическая роль существующих функций server и ai.
+endlegend
+@enduml

@@ -7,7 +7,10 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-COMPOSE = ['docker', 'compose', '-f', 'docker-compose.yml', '-f', 'compose.tunnel.yml']
+COMPOSE = ['docker', 'compose', '-f', 'docker-compose.yml']
+if sys.platform == 'darwin':
+    COMPOSE += ['-f', 'compose.mac.yml']
+COMPOSE += ['-f', 'compose.tunnel.yml']
 URL_PATTERN = re.compile(r'https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com\b')
 
 

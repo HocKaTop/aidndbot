@@ -1,0 +1,148 @@
+@startuml
+' Sources: backend/internal/server/rooms.go; backend/internal/game/state.go;
+' backend/internal/store/models.go; backend/migrations/001_initial.sql.
+' Runtime aggregates and persisted domain records are distinguished by package and notes.
+title Предметная модель игры
+top to bottom direction
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam defaultFontSize 13
+skinparam nodesep 20
+skinparam ranksep 30
+hide empty methods
+
+package "server" {
+  class "Room" as Room {
+    ID : string
+    Code : string
+    OwnerID : int64
+    Status : string
+    State : game.State
+  }
+}
+
+package "store" {
+  class "User" as User {
+    ID : int64
+    FirstName : string
+    Username : string
+  }
+  class "RoomMember" as RoomMember {
+    RoomID : UUID
+    UserID : int64
+    Role : string
+    Ready : bool
+    JoinedAt : timestamp
+  }
+  class "GameEvent" as GameEvent {
+    ID : UUID
+    RoomID : UUID
+    ActorID : nullable int64
+    Type : string
+    Payload : JSONB
+    Sequence : int64
+    CreatedAt : timestamp
+  }
+}
+
+package "game" {
+  class "State" as State {
+    Turn : int
+    Summary : string
+    GMNotes : []string
+    Combat : bool
+    CombatOrder : []int64
+    CombatIndex : int
+    CombatRound : int
+    CombatTurnSince : time.Time
+  }
+  class "Character" as Character {
+    ID : string
+    UserID : int64
+    Name : string
+    Race : string
+    Class : string
+    ClassID : string
+    Level : int
+    HP : int
+    MaxHP : int
+    ArmorClass : int
+    Experience : int
+    Resource : int
+    ResourceMax : int
+  }
+  class "Stats" as Stats {
+    Strength : int
+    Dexterity : int
+    Constitution : int
+    Intelligence : int
+    Wisdom : int
+    Charisma : int
+  }
+  class "Item" as Item {
+    ID : string
+    Name : string
+    Description : string
+    Quantity : int
+    Type : string
+  }
+  class "NPC" as NPC {
+    ID : string
+    Name : string
+    Description : string
+    HP : int
+    MaxHP : int
+    ArmorClass : int
+    Alive : bool
+    Disposition : string
+    Location : string
+  }
+  class "Quest" as Quest {
+    ID : string
+    Title : string
+    Description : string
+    Status : string
+    Rewarded : bool
+  }
+  class "Scene" as Scene {
+    ID : string
+    Title : string
+    Description : string
+    Location : string
+  }
+  class "QuestCompletionProposal" as Proposal {
+    QuestID : string
+    Reason : string
+  }
+  class "Ending" as Ending {
+    Reason : string
+    Note : string
+    FinishedAt : time.Time
+  }
+}
+
+User "1" <-- "0..*" Room : владелец
+Room "1" -- "1..*" RoomMember : участники
+User "1" -- "0..*" RoomMember : членство
+Room "1" *-- "1" State : State
+State "1" *-- "0..*" Character : Characters
+State "1" *-- "0..*" NPC : NPCs
+State "1" *-- "0..*" Quest : Quests
+State "1" *-- "0..1" Scene : Scene (текущая)
+State "1" *-- "0..1" Proposal : предложение
+State "1" *-- "0..1" Ending : Ending
+Character "1" *-- "1" Stats : Stats
+Character "1" *-- "0..*" Item : Inventory
+User "1" <-- "0..*" Character : UserID
+Proposal "0..1" --> "1" Quest : QuestID
+Room "1" -- "0..*" GameEvent : журнал
+User "0..1" <-- "0..*" GameEvent : ActorID
+
+note bottom of Character
+  Один герой пользователя в каждой комнате.
+end note
+legend bottom
+  Room — агрегат сервера; State — состояние игры; store — сохранённые доменные записи.
+  UUID / JSONB / timestamp — типы хранения; ActorID может отсутствовать у событий системы.
+endlegend
+@enduml

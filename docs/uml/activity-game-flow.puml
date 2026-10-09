@@ -1,0 +1,46 @@
+@startuml
+' Sources: backend/internal/server/{rooms,text,opening,turn,ending}.go;
+' backend/internal/game/{engine,state,turn_order,progression}.go.
+' Quest and ending checks precede persistence, as in the current implementation.
+title Основной игровой процесс
+skinparam shadowing false
+skinparam defaultFontSize 13
+skinparam activityDiamondFontSize 12
+
+start
+:Создать комнату или войти по коду;
+:WAITING — ожидание игроков;
+:Создать / выбрать персонажа;\nподтвердить готовность отряда;
+:Запуск владельцем готовой кампании;\nAI-вступление и начальная цель;
+
+repeat
+  :Получить действие игрока;
+  if (Действие допустимо?) then (да)
+    switch (Тип действия)
+      case (обычное)
+        :AI Game Master + LLM:\nподготовить игровые действия;
+      case (боевое)
+        :Combat Logic:\nрассчитать бой и очередь ходов;
+      case (системное)
+        :Server:\nобработать управление кампанией;
+    endswitch
+    :Обновить Game State по правилам;
+    :Проверить состояние Quest;
+    :Определить статус кампании:\nPLAYING / PAUSED / FINISHED;
+    :Сохранить состояние и журнал;
+    :Отправить результат игроку;
+  else (нет)
+    :Отклонить действие;
+  endif
+repeat while (Кампания не завершена?) is (да) not (нет)
+
+:FINISHED — итоги и история доступны;
+stop
+
+legend bottom
+  Старт требует готовности всех игроков и успешного AI-вступления.
+  На паузе доступны команды управления; ошибки сохраняют прежнее состояние.
+  Завершение: поражение отряда, проверенная цель или решение владельца.
+  В пользовательской кампании завершение цели подтверждает владелец.
+endlegend
+@enduml

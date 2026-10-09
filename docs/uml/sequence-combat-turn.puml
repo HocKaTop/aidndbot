@@ -1,0 +1,41 @@
+@startuml
+' Sources: backend/internal/server/{combat_intent,turn}.go;
+' backend/internal/game/{engine,combat,turn_order,progression}.go.
+' Explicit text attack (player_action) after transport, membership and room checks.
+' Combat Logic groups existing game functions; it is not a separate Go struct.
+' Flowchart representation: the original messages, decisions and notes are preserved.
+title Боевой ход: явная атака
+skinparam shadowing false
+skinparam defaultFontSize 13
+skinparam activityDiamondFontSize 12
+skinparam wrapWidth 320
+
+start
+:**Player → Server**\nАтаковать выбранную цель;
+:**Server → Game Logic**\nПрименить атаку к State;
+:**Game Logic**\nПроверить доступность цели;
+:**Game Logic → Combat Logic**\nРассчитать попадание и урон\n**Combat Logic → Game Logic**\nРезультат атаки;
+:**Game Logic → Server**\nИзменённое State и результат;
+:**Server → Game Logic**\nИнициатива и ответ противника;
+if (Герой и противник живы, бой продолжается?) then (да)
+  :**Game Logic → Combat Logic**\nРассчитать ответную атаку\n**Combat Logic → Game Logic**\nРезультат ответа;
+else (нет)
+endif
+:**Game Logic → Server**\nИзменения HP и опыта;
+:**Server**\nПроверить исход боя;
+:**Server → Game Logic**\nОбновить очередь ходов\n**Game Logic → Server**\nСледующий герой / конец боя;
+:**Server**\nСформировать текст результата;
+:**Server → Database**\nСохранить State и события\n**Database → Server**\nСохранено;
+:**Server → Player**\nРезультат боевого хода;
+
+stop
+
+legend bottom
+  Для явной атаки AI / LLM не вызываются; транспорт и загрузка комнаты опущены.
+  Ответ противника выполняется только при наличии живого врага и героя в бою.
+
+  Участники и роли:
+  Game Logic · (game)
+  Combat Logic · (game)
+endlegend
+@enduml

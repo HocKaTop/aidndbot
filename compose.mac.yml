@@ -1,0 +1,7 @@
+services:
+  ollama:
+    gpus: !reset []
+  backend:
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      DEFAULT_OLLAMA_MODEL: qwen3.5:9b

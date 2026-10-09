@@ -1,0 +1,36 @@
+@startuml
+' Sources: backend/internal/bot/bot.go; backend/internal/server/{text,turn,plan,rooms}.go;
+' backend/internal/ai/ollama.go; backend/internal/game/{state,engine}.go.
+' Successful non-combat player_action. Server orchestrates both game and AI functions.
+' Final narration is a semantic interaction; additional LLM calls remain in the detailed version.
+' Flowchart representation: the original messages, decisions and notes are preserved.
+title Один обычный ход игрока
+skinparam shadowing false
+skinparam defaultFontSize 13
+skinparam activityDiamondFontSize 12
+skinparam wrapWidth 320
+
+start
+:**Player → Telegram Bot**\nТекстовое действие;
+:**Telegram Bot → Server**\nСообщение игрока;
+:**Server → Database**\nЗагрузить State и контекст\n**Database → Server**\nСостояние и контекст;
+:**Server → Game Logic**\nПроверить условия хода\n**Game Logic → Server**\nХод допустим;
+:**Server → AI Game Master**\nТекущее State и действие;
+:**AI Game Master → LLM Client**\nПодготовить prompt и план;
+:**LLM Client → LLM**\nLLM HTTP API\n**LLM → LLM Client**\nСтруктурированный ответ;
+:**LLM Client → AI Game Master**\nИгровые действия и текст;
+:**AI Game Master**\nСогласовать план с правилами;
+:**AI Game Master → Server**\nПроверенный план;
+:**Server → Game Logic**\nПрименить игровые действия\n**Game Logic → Server**\nНовое State и результаты;
+:**Server → AI Game Master**\nПодготовить итоговый ответ\n**AI Game Master → Server**\nИтоговое повествование;
+:**Server → Database**\nСохранить State и события\n**Database → Server**\nСохранено;
+:**Server → Telegram Bot**\nТекст ответа;
+:**Telegram Bot → Player**\nОтвет ведущего;
+
+stop
+
+legend bottom
+  Успешный ход в активной кампании; игрок допущен к действию.
+  Game Logic и AI Game Master — роли внутри backend; ход координирует Server.
+endlegend
+@enduml
